@@ -1,3 +1,5 @@
+![vllm-exl3 — EXL3 quantization plugin for routed MoE serving](assets/header.png)
+
 # vllm-exl3
 
 [![Follow on X](https://img.shields.io/badge/Follow-%40ViC305-black?logo=x)](https://x.com/ViC305) [![Follow on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Follow-vcruz305-yellow)](https://huggingface.co/vcruz305)
