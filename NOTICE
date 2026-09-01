@@ -1,0 +1,4 @@
+vllm-exl3
+Copyright 2026 Victor Cruz (vcruz305)
+
+EXL3 (ExLlamaV3 trellis/MCG) quantization serving support for vLLM fork runtimes.
