@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: the `glm53_exl3_plugin` compatibility shim now provides a real `glm53_exl3_plugin.exl3` submodule (submodule imports bypassed the lazy alias).
+
 ## 0.2.0
 
 First standalone release. Renamed from `glm53_exl3_plugin` 0.1.1 — identical
