@@ -76,3 +76,12 @@ and will be removed in a future release.
 
 Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
 `LICENSE` §4(d).
+
+## Roadmap
+
+- **0.3.0 — stock vLLM support (DeepSeek-V4 first).** Compat layer for stock's
+  `FusedMoE`/`FusedMoEMethodBase` alongside the fork's `RoutedExperts`, quant
+  registration via `register_quantization_config`, non-routed delegation to
+  stock `fp8`. GLM-5.3 remains fork-only until the architecture exists upstream.
+- Fat-expert prefill acceleration (sorted/batched expert dispatch) for extreme
+  contexts.
