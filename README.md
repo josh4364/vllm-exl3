@@ -77,6 +77,29 @@ and will be removed in a future release.
 Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
 `LICENSE` §4(d).
 
+## EXL3 packs and recipes
+
+### Packs (Hugging Face)
+
+| Model | Description |
+|---|---|
+| [GLM-5.3-Flash-EXL3-K2](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2) | GLM-5.3-Flash, 2-bit routed experts |
+| [GLM-5.3-Flash-Uncensored-EXL3-K2](https://huggingface.co/vcruz305/GLM-5.3-Flash-Uncensored-EXL3-K2) | GLM-5.3-Flash Uncensored, 2-bit routed experts |
+| [GLM-5.3-Flash-EXL3](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3) | GLM-5.3-Flash, 3-bit routed experts |
+| [GLM-5.3-Flash-EXL3-K2K3-mix](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix) | GLM-5.3-Flash, mixed 2/3-bit routed experts |
+| [DSV4-Flash-Vision-EXL3-MixedK](https://huggingface.co/vcruz305/DSV4-Flash-Vision-EXL3-MixedK) | DeepSeek-V4-Flash Vision, mixed-bit routed experts |
+| [DSV4-Flash-Vision-ablit-EXL3-MixedK](https://huggingface.co/vcruz305/DSV4-Flash-Vision-ablit-EXL3-MixedK) | DeepSeek-V4-Flash Vision Uncensored, mixed-bit routed experts |
+
+### Serving recipes (GitHub)
+
+| Recipe | Description |
+|---|---|
+| [GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2 on DGX Spark |
+| [GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2/K3 mix on DGX Spark |
+| [DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe) | DeepSeek-V4-Flash Vision EXL3 MixedK on DGX Spark |
+| [GLM-5.3-Flash-EXL3-K2-spark-vllm](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2-spark-vllm) | Prebuilt vLLM runtime wheels |
+
+
 ## Roadmap
 
 - **0.3.0 — stock vLLM support (DeepSeek-V4 first).** Compat layer for stock's
