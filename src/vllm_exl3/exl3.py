@@ -519,6 +519,12 @@ class Exl3Config(QuantizationConfig):
         )
         # __init__ swallows unknown kwargs; stash the delegation dict explicitly.
         inst.non_routed_quantization = config.get("non_routed_quantization")
+        # Mixed-format packs: draft/MTP blocks appended past the main stack can
+        # keep their experts in the source format (e.g. MXFP4). Declare
+        # mtp_experts: "source" plus mtp_experts_start_layer: <first draft
+        # layer index>; those layers delegate to non_routed_quantization.
+        inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
+        inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
         return inst
 
     @classmethod
@@ -537,6 +543,18 @@ class Exl3Config(QuantizationConfig):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
         if isinstance(layer, RoutedExperts):
+            # Draft/MTP blocks construct with plain layers.N prefixes (the
+            # mtp_block name appears only in parameter paths), so gate by
+            # declared layer index, never by name.
+            if getattr(self, "mtp_experts", "exl3") == "source":
+                _start = getattr(self, "mtp_experts_start_layer", None)
+                _lm = re.search(r"layers\.(\d+)\.", prefix)
+                if _start is not None and _lm and int(_lm.group(1)) >= int(_start):
+                    d = self._non_routed_delegate()
+                    if d is not None:
+                        dm = d.get_quant_method(layer, prefix)
+                        if dm is not None:
+                            return dm
             return Exl3MoEMethod(
                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
             )
