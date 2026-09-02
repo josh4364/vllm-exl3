@@ -27,7 +27,11 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.utils import set_weight_attrs
@@ -44,7 +48,9 @@ logger = init_logger("vllm." + __name__)
 
 MCG_MULTIPLIER = 0xCBAC1FED
 MCG_MARKER_SIGNED_INT32 = -877912083
-EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg")
+MUL1_MULTIPLIER = 0x83DCD12D
+MUL1_MARKER_SIGNED_INT32 = -2082680531
+EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
 TEMP_ROWS_FUSED = 2048
 MOE_ACT_SILU = 0
@@ -102,7 +108,8 @@ def make_linear_exl3(
     trellis: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
-    mcg: torch.Tensor,
+    mcg: torch.Tensor | None = None,
+    mul1: torch.Tensor | None = None,
     *,
     out_dtype: torch.dtype = torch.float16,
 ):
@@ -115,7 +122,8 @@ def make_linear_exl3(
         trellis=trellis.contiguous(),
         suh=suh.contiguous(),
         svh=svh.contiguous(),
-        mcg=mcg.contiguous(),
+        mcg=mcg.contiguous() if mcg is not None else None,
+        mul1=mul1.contiguous() if mul1 is not None else None,
         out_dtype=out_dtype,
         transformers_fix=True,
     )
@@ -126,12 +134,13 @@ def execute_exl3_linear(
     trellis: torch.Tensor,
     suh: torch.Tensor,
     svh: torch.Tensor,
-    mcg: torch.Tensor,
+    mcg: torch.Tensor | None = None,
+    mul1: torch.Tensor | None = None,
     *,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Real EXL3 expert GEMM entry (LinearEXL3 / exllamav3_ext)."""
-    inner = make_linear_exl3(trellis, suh, svh, mcg, out_dtype=torch.float16)
+    inner = make_linear_exl3(trellis, suh, svh, mcg, mul1, out_dtype=torch.float16)
     return inner.forward(x.contiguous().half(), {}, out_dtype=out_dtype)
 
 
@@ -438,6 +447,12 @@ def _suffix_from_mapped_name(weight_name: str) -> str:
     raise ValueError(f"not an EXL3 packed name: {weight_name}")
 
 
+def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
+    """Module-path suffix match: "self_attn.o_proj" matches
+    "model.layers.3.self_attn.o_proj" but not "...cross_attn.o_proj_x"."""
+    return prefix == suffix or prefix.endswith("." + suffix)
+
+
 @register_quantization_config("exl3")
 class Exl3Config(QuantizationConfig):
     """Routed-experts-only EXL3/MCG. Dense / shared / attention stay native."""
@@ -467,10 +482,42 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(
                     f"unsupported EXL3 bits={layer_k} for layer {layer_idx}"
                 )
-        self.raw_config = dict(kwargs)
-        if self.codebook != "mcg":
+        # Non-routed dense linear config: optional {"modules": [...], "bits": K, "layer_bits": {...},
+        # "codebook": "mcg"|"mul1", "layers": {prefix: {"bits": K, "bf16_shards": [...]}, ...}}
+        raw_nr_exl3 = kwargs.pop("non_routed_exl3", None) or {}
+        self.non_routed_exl3: dict[str, Any] = dict(raw_nr_exl3) if raw_nr_exl3 else {}
+        # Validate non-routed bits if present
+        nr_bits = self.non_routed_exl3.get("bits")
+        if nr_bits is not None and nr_bits not in (2, 3, 4, 5, 6):
+            raise ValueError(f"unsupported non_routed_exl3 bits={nr_bits}")
+        nr_layer_bits = self.non_routed_exl3.get("layer_bits", {})
+        for suffix, k in (nr_layer_bits or {}).items():
+            if k not in (2, 3, 4, 5, 6):
+                raise ValueError(
+                    f"unsupported non_routed_exl3 bits={k} for suffix {suffix}"
+                )
+        # Validate non-routed layers dict: each value is {"bits": K[, "bf16_shards": [...]]}
+        nr_layers = self.non_routed_exl3.get("layers", {})
+        for prefix, layer_cfg in (nr_layers or {}).items():
+            if not isinstance(layer_cfg, dict):
+                raise ValueError(
+                    f"non_routed_exl3 layers[{prefix}] must be a dict, got {type(layer_cfg)}"
+                )
+            layer_bits = layer_cfg.get("bits")
+            if layer_bits is not None and layer_bits not in (2, 3, 4, 5, 6):
+                raise ValueError(
+                    f"unsupported non_routed_exl3 layers[{prefix}] bits={layer_bits}"
+                )
+        # Validate non-routed codebook
+        nr_codebook = self.non_routed_exl3.get("codebook", "mcg")
+        if nr_codebook not in ("mcg", "mul1"):
             raise ValueError(
-                f"this overlay only implements codebook=mcg; got {self.codebook!r}"
+                f"unsupported non_routed_exl3 codebook={nr_codebook!r}; must be 'mcg' or 'mul1'"
+            )
+        self.raw_config = dict(kwargs)
+        if self.codebook not in ("mcg", "mul1"):
+            raise ValueError(
+                f"unsupported codebook={self.codebook!r}; must be 'mcg' or 'mul1'"
             )
         if self.bits not in (2, 3, 4, 5, 6):
             raise ValueError(f"unsupported EXL3 bits={self.bits}")
@@ -488,6 +535,57 @@ class Exl3Config(QuantizationConfig):
         if m is None:
             return self.bits
         return self.layer_bits.get(int(m.group(1)), self.bits)
+
+    def _matches_non_routed_exl3(self, prefix: str) -> bool:
+        """Check if prefix matches non_routed_exl3: either layers dict keys or modules list."""
+        if not self.non_routed_exl3:
+            return False
+        # Check if prefix is a key in the layers dict
+        layers = self.non_routed_exl3.get("layers", {})
+        if layers and prefix in layers:
+            return True
+        # Fall back to suffix matching on modules list
+        modules = self.non_routed_exl3.get("modules", [])
+        if not modules:
+            return False
+        return any(_prefix_has_suffix(prefix, m) for m in modules)
+
+    def _bits_for_non_routed(self, prefix: str) -> int:
+        """Get K bits for non_routed_exl3 layer, checking layers dict first, then suffix form."""
+        if not self.non_routed_exl3:
+            return self.bits
+        # Check layers dict first
+        layers = self.non_routed_exl3.get("layers", {})
+        if layers and prefix in layers:
+            layer_cfg = layers[prefix]
+            if "bits" in layer_cfg:
+                return int(layer_cfg["bits"])
+            return int(self.non_routed_exl3.get("bits", self.bits))
+        # Fall back to suffix matching
+        modules = self.non_routed_exl3.get("modules", [])
+        matched_suffix = None
+        for suffix in modules:
+            if _prefix_has_suffix(prefix, suffix):
+                matched_suffix = suffix
+                break
+        if matched_suffix is None:
+            return self.bits
+        # Check layer_bits override for this suffix
+        layer_bits = self.non_routed_exl3.get("layer_bits", {})
+        if matched_suffix in layer_bits:
+            return int(layer_bits[matched_suffix])
+        # Fall back to non_routed_exl3 bits or base bits
+        return int(self.non_routed_exl3.get("bits", self.bits))
+
+    def _bf16_shards_for(self, prefix: str) -> list[int]:
+        """Get bf16 shard indices for a non_routed_exl3 layer from the layers dict."""
+        if not self.non_routed_exl3:
+            return []
+        layers = self.non_routed_exl3.get("layers", {})
+        if layers and prefix in layers:
+            layer_cfg = layers[prefix]
+            return list(layer_cfg.get("bf16_shards", []))
+        return []
 
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.float16, torch.float32]
@@ -510,15 +608,23 @@ class Exl3Config(QuantizationConfig):
             "quant_method",
             # Some packs ship a large per-tensor ledger here; keep it off the config object.
             "tensor_storage",
+            "non_routed_exl3",
+            "non_routed_quantization",
+            "mtp_experts",
+            "mtp_experts_start_layer",
         }
         inst = cls(
             bits=int(config.get("bits", 4)),
             codebook=str(config.get("codebook", "mcg")),
             scope=str(config.get("scope", "glm53_routed_experts_only")),
+            non_routed_exl3=config.get("non_routed_exl3"),
             **{k: v for k, v in config.items() if k not in skip},
         )
         # __init__ swallows unknown kwargs; stash the delegation dict explicitly.
         inst.non_routed_quantization = config.get("non_routed_quantization")
+        # "bf16_as_stored": dense linears are BF16 tensors; never delegate them
+        # (the delegate still serves source-format MTP experts).
+        inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
         # Mixed-format packs: draft/MTP blocks appended past the main stack can
         # keep their experts in the source format (e.g. MXFP4). Declare
         # mtp_experts: "source" plus mtp_experts_start_layer: <first draft
@@ -559,6 +665,12 @@ class Exl3Config(QuantizationConfig):
                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
             )
         if isinstance(layer, LinearBase):
+            # Check if this LinearBase should use non_routed_exl3
+            if self._matches_non_routed_exl3(prefix):
+                bits = self._bits_for_non_routed(prefix)
+                return Exl3LinearMethod(self, bits=bits)
+            if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
+                return UnquantizedLinearMethod()
             d = self._non_routed_delegate()
             if d is not None:
                 m = d.get_quant_method(layer, prefix)
@@ -853,3 +965,419 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return apply_exl3_experts(
             x, topk_ids, topk_weights, layer, limit=float(limit)
         )
+
+
+class Exl3LinearMethod(LinearMethodBase):
+    """Non-routed (dense) EXL3 linear method for QKV/MLP dense projections.
+
+    This method handles trellis/suh/svh/mcg parameters for non-routed dense
+    linear layers, building LinearEXL3 objects after weight loading and applying
+    them with proper TP slicing and shard concatenation.
+    """
+
+    def __init__(self, quant_config: Exl3Config, bits: int | None = None) -> None:
+        self.quant_config = quant_config
+        self.bits = int(bits) if bits is not None else quant_config.bits
+        self._logged = False
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from vllm.model_executor.layers.linear import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+            QKVParallelLinear,
+            MergedColumnParallelLinear,
+        )
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        # Determine layer type and shard behavior
+        n_shards = len(output_partition_sizes)
+        is_row_parallel = isinstance(layer, RowParallelLinear)
+        is_col_parallel = isinstance(layer, ColumnParallelLinear)
+        is_qkv_parallel = isinstance(layer, QKVParallelLinear)
+        is_merged_col_parallel = isinstance(layer, MergedColumnParallelLinear)
+
+        # For column-parallel: output dimension is sharded (each shard has different outputs)
+        # For row-parallel: input dimension is sharded (each shard has same input, different outputs)
+        if is_row_parallel:
+            # Input is partitioned across ranks, each rank gets full input height
+            in_per_partition = input_size_per_partition
+        else:
+            # Column-parallel or unsharded: each rank gets full input
+            in_per_partition = input_size_per_partition
+
+        # Get bf16_shards from config (may be empty)
+        bf16_shards = self.quant_config._bf16_shards_for(getattr(layer, "prefix", ""))
+        if bf16_shards:
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                raise RuntimeError(
+                    f"EXL3 bf16 shards are not supported with TP size > 1; tp_size={tp_size}"
+                )
+
+        # K words per shard
+        k_words = self.bits * 16
+
+        # Validate tile alignment for all shards
+        for i, out_size in enumerate(output_partition_sizes):
+            if in_per_partition % 16 or out_size % 16:
+                raise ValueError(
+                    f"EXL3 trellis tiles are 16-wide; "
+                    f"shard {i}: in={in_per_partition} out={out_size}"
+                )
+
+        in_tiles = in_per_partition // 16
+        out_tiles_list = [s // 16 for s in output_partition_sizes]
+        total_out_tiles = sum(out_tiles_list)
+
+        # Allocate fused trellis covering all shards (dim1 will be narrow per-shard)
+        trellis_param = Parameter(
+            torch.empty(in_tiles, total_out_tiles, k_words, dtype=torch.int16),
+            requires_grad=False,
+        )
+        # Per-shard suh (one per shard, each covers this rank's input partition)
+        suh_param = Parameter(
+            torch.empty(n_shards, in_per_partition, dtype=torch.float16),
+            requires_grad=False,
+        )
+        # Per-shard svh (one per shard, concatenated)
+        svh_param = Parameter(
+            torch.empty(sum(output_partition_sizes), dtype=torch.float16),
+            requires_grad=False,
+        )
+        # Per-shard mcg and mul1 markers (both registered, one will be nonzero)
+        mcg_param = Parameter(
+            torch.zeros(n_shards, 1, dtype=torch.int32),
+            requires_grad=False,
+        )
+        mul1_param = Parameter(
+            torch.zeros(n_shards, 1, dtype=torch.int32),
+            requires_grad=False,
+        )
+
+        # Staging parameter for bf16 shards: rows are concatenated bf16 weights
+        bf16_rows = sum(output_partition_sizes[i] for i in bf16_shards)
+        weight_param = Parameter(
+            torch.empty(bf16_rows, in_per_partition, dtype=params_dtype),
+            requires_grad=False,
+        )
+
+        layer.register_parameter("trellis", trellis_param)
+        layer.register_parameter("suh", suh_param)
+        layer.register_parameter("svh", svh_param)
+        layer.register_parameter("mcg", mcg_param)
+        layer.register_parameter("mul1", mul1_param)
+        layer.register_parameter("weight", weight_param)
+
+        # Custom weight loader
+        extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
+        set_weight_attrs(trellis_param, extra)
+        set_weight_attrs(suh_param, extra)
+        set_weight_attrs(svh_param, extra)
+        set_weight_attrs(mcg_param, extra)
+        set_weight_attrs(mul1_param, extra)
+        set_weight_attrs(weight_param, extra)
+
+        # vLLM calls ``weight_loader(param, loaded_weight[, shard_id])`` and
+        # never passes the checkpoint name, so bind the tensor kind per param.
+        for suffix, p in (
+            ("trellis", trellis_param),
+            ("suh", suh_param),
+            ("svh", svh_param),
+            ("mcg", mcg_param),
+            ("mul1", mul1_param),
+        ):
+            p.weight_loader = self._make_weight_loader(
+                suffix, n_shards, output_partition_sizes, is_row_parallel, bf16_shards
+            )
+        weight_param.weight_loader = self._make_weight_loader(
+            "weight", n_shards, output_partition_sizes, is_row_parallel, bf16_shards
+        )
+
+        # Store metadata
+        layer._exl3_linear_n_shards = n_shards
+        layer._exl3_linear_output_partition_sizes = output_partition_sizes
+        layer._exl3_linear_input_size_per_partition = in_per_partition
+        layer._exl3_linear_is_row_parallel = is_row_parallel
+        layer._exl3_linear_is_qkv = is_qkv_parallel
+        layer._exl3_linear_is_merged = is_merged_col_parallel
+        layer._exl3_linear_bf16_shards = bf16_shards
+
+    def _make_weight_loader(self, suffix, n_shards, output_partition_sizes, is_row_parallel, bf16_shards):
+        """Create a weight_loader closure for EXL3 linear parameters."""
+
+        def weight_loader(
+            param: Parameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: str | int | None = None,
+        ) -> None:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # Map shard_id to shard index
+            shard_idx = 0
+            if loaded_shard_id is not None:
+                if isinstance(loaded_shard_id, str):
+                    # "q", "k", "v" for QKV layers
+                    shard_map = {"q": 0, "k": 1, "v": 2}
+                    if loaded_shard_id not in shard_map:
+                        raise ValueError(
+                            f"unknown shard_id={loaded_shard_id} for EXL3 linear"
+                        )
+                    shard_idx = shard_map[loaded_shard_id]
+                elif isinstance(loaded_shard_id, int):
+                    shard_idx = loaded_shard_id
+            if shard_idx >= n_shards:
+                raise ValueError(
+                    f"shard_idx={shard_idx} out of range for n_shards={n_shards}"
+                )
+
+            # Special handling for weight (bf16 staging) and markers
+            if suffix in ("weight", "mcg", "mul1"):
+                # Weight parameter: only load bf16 shards, discard EXL3 shards
+                if suffix == "weight":
+                    # Check shape matches the expected shard size
+                    expected_out = output_partition_sizes[shard_idx]
+                    expected_in = param.shape[1]
+                    loaded_shape = loaded_weight.shape
+                    if loaded_shape[0] != expected_out or (len(loaded_shape) > 1 and loaded_shape[1] != expected_in):
+                        # After TP narrowing, expect (shard_out, in)
+                        tp_sharded = _narrow_tp(loaded_weight, 0, tp_rank, tp_size) if is_row_parallel else _narrow_tp(loaded_weight, 1, tp_rank, tp_size) if not is_row_parallel else loaded_weight
+                        if tuple(tp_sharded.shape) != (expected_out, expected_in):
+                            raise RuntimeError(
+                                f"EXL3 weight load shape mismatch shard={shard_idx}: "
+                                f"expected ({expected_out},{expected_in}) but got {tuple(loaded_weight.shape)} "
+                                f"(after TP: {tuple(tp_sharded.shape)})"
+                            )
+                    # If this shard is in bf16_shards, copy; otherwise discard
+                    if shard_idx in bf16_shards:
+                        bf16_idx = bf16_shards.index(shard_idx)
+                        bf16_row_start = sum(output_partition_sizes[i] for i in bf16_shards[:bf16_idx])
+                        bf16_row_end = bf16_row_start + expected_out
+                        param.data[bf16_row_start:bf16_row_end].copy_(loaded_weight.detach())
+                    # else: discard this EXL3 shard's stale BF16 weight
+                    return
+                else:
+                    # Marker (mcg or mul1): store the value (will be 0 if marker not present)
+                    dest = param.data[shard_idx]
+                    if tuple(dest.shape) != (1,):
+                        raise RuntimeError(
+                            f"EXL3 {suffix} marker shape mismatch: expected (1,) got {tuple(dest.shape)}"
+                        )
+                    loaded_val = loaded_weight.detach().item() if loaded_weight.numel() > 0 else 0
+                    dest[0] = int(loaded_val)
+                    return
+
+            # Normal EXL3 suffix handling (trellis, suh, svh)
+            loaded = loaded_weight.detach().contiguous()
+
+            # Apply TP slicing based on layer type
+            if is_row_parallel:
+                # Row-parallel: input is sharded, trellis dim 0 and suh dim 0
+                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+            else:
+                # Column-parallel: output is sharded, trellis dim 1 and svh dim 0
+                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+
+            # Copy into the right location
+            if suffix == "trellis":
+                # Trellis is fused; narrow dim1 for this shard
+                out_tiles_start = sum(s // 16 for s in output_partition_sizes[:shard_idx])
+                out_tiles_end = out_tiles_start + output_partition_sizes[shard_idx] // 16
+                dest = param.data[:, out_tiles_start:out_tiles_end, :]
+            elif suffix == "suh":
+                # Suh per-shard
+                dest = param.data[shard_idx]
+            elif suffix == "svh":
+                # Svh is concatenated; slice for this shard
+                out_start = sum(output_partition_sizes[:shard_idx])
+                out_end = out_start + output_partition_sizes[shard_idx]
+                dest = param.data[out_start:out_end]
+            else:
+                raise ValueError(f"unknown EXL3 suffix={suffix}")
+
+            if tuple(dest.shape) != tuple(sharded.shape):
+                raise RuntimeError(
+                    f"EXL3 linear load shape mismatch shard={shard_idx} "
+                    f"suffix={suffix}: dest {tuple(dest.shape)} != "
+                    f"loaded {tuple(sharded.shape)}"
+                )
+            dest.copy_(sharded)
+
+        return weight_loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not hasattr(layer, "trellis"):
+            return
+
+        # Get bf16 shards and verify exactly one marker per EXL3 shard
+        n_shards = int(layer._exl3_linear_n_shards)
+        output_sizes = layer._exl3_linear_output_partition_sizes
+        bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+
+        mcg_vals = layer.mcg.reshape(-1)
+        mul1_vals = layer.mul1.reshape(-1)
+
+        for i in range(n_shards):
+            # Skip marker checks for bf16 shards - they don't use LinearEXL3
+            if i in bf16_shards:
+                continue
+            mcg_is_set = mcg_vals[i].item() != 0
+            mul1_is_set = mul1_vals[i].item() != 0
+            if mcg_is_set and mul1_is_set:
+                raise RuntimeError(
+                    f"EXL3 linear shard {i}: both mcg and mul1 markers are set; "
+                    f"exactly one codebook marker must be present"
+                )
+            if not mcg_is_set and not mul1_is_set:
+                raise RuntimeError(
+                    f"EXL3 linear shard {i}: neither mcg nor mul1 marker is set; "
+                    f"exactly one codebook marker must be present"
+                )
+            # Verify marker value
+            if mcg_is_set and mcg_vals[i].item() != MCG_MARKER_SIGNED_INT32:
+                raise RuntimeError(
+                    f"EXL3 linear shard {i}: mcg marker is {mcg_vals[i].item()}, "
+                    f"expected {MCG_MARKER_SIGNED_INT32}"
+                )
+            if mul1_is_set and mul1_vals[i].item() != MUL1_MARKER_SIGNED_INT32:
+                raise RuntimeError(
+                    f"EXL3 linear shard {i}: mul1 marker is {mul1_vals[i].item()}, "
+                    f"expected {MUL1_MARKER_SIGNED_INT32}"
+                )
+
+        # Build LinearEXL3 objects for EXL3 shards only (skip bf16 shards)
+        linears = []
+        for i in range(n_shards):
+            if i in bf16_shards:
+                # bf16 shards don't use LinearEXL3; store None as placeholder
+                linears.append(None)
+                continue
+            out_tiles_start = sum(s // 16 for s in output_sizes[:i])
+            out_tiles_end = out_tiles_start + output_sizes[i] // 16
+            trellis_shard = layer.trellis[:, out_tiles_start:out_tiles_end, :].contiguous()
+            suh_shard = layer.suh[i].contiguous()
+            svh_shard = layer.svh[
+                sum(output_sizes[:i]) : sum(output_sizes[: i + 1])
+            ].contiguous()
+            mcg_shard = layer.mcg[i].contiguous() if mcg_vals[i].item() != 0 else None
+            mul1_shard = layer.mul1[i].contiguous() if mul1_vals[i].item() != 0 else None
+
+            linear = make_linear_exl3(
+                trellis_shard, suh_shard, svh_shard, mcg_shard, mul1_shard, out_dtype=torch.float16
+            )
+            linears.append(linear)
+
+        layer._exl3_linears = linears
+
+        # Keep bf16 weights if present, remove weight staging param if all loaded
+        if bf16_shards and hasattr(layer, "weight"):
+            bf16_rows = sum(output_sizes[i] for i in bf16_shards)
+            if bf16_rows > 0:
+                layer._exl3_bf16_weight = layer.weight.data.clone()
+            # Delete weight staging param only if it has rows; empty param stays as placeholder
+            if layer.weight.data.shape[0] > 0:
+                try:
+                    delattr(layer, "weight")
+                except Exception:
+                    pass
+        elif hasattr(layer, "weight"):
+            # No bf16 shards, delete the staging param
+            try:
+                delattr(layer, "weight")
+            except Exception:
+                pass
+
+        # Free fused parameters to avoid memory doubling
+        for param_name in ("trellis", "suh", "svh", "mcg", "mul1"):
+            if hasattr(layer, param_name):
+                try:
+                    delattr(layer, param_name)
+                except Exception:
+                    pass
+
+    def apply(
+        self,
+        layer,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        linears = getattr(layer, "_exl3_linears", None)
+        if not linears:
+            raise RuntimeError("EXL3 linear layers were not built after weight load")
+
+        # x shape: (batch, in_features) or (batch, ..., in_features)
+        # Flatten to 2D: (rows, in_features)
+        orig_shape = x.shape
+        if len(orig_shape) > 2:
+            # Multi-dim input: flatten to (rows, in)
+            rows = 1
+            for d in orig_shape[:-1]:
+                rows *= d
+            x_2d = x.reshape(rows, orig_shape[-1])
+        else:
+            x_2d = x
+
+        # Cast to contiguous fp16 for EXL3 shards
+        x_fp16 = x_2d.to(torch.float16).contiguous()
+
+        # Get bf16 shards and weight if present
+        bf16_shards = getattr(layer, "_exl3_linear_bf16_shards", [])
+        bf16_weight = getattr(layer, "_exl3_bf16_weight", None)
+        output_sizes = layer._exl3_linear_output_partition_sizes
+        n_shards = len(linears)
+
+        # Run each shard in declared order
+        outputs = []
+        for i in range(n_shards):
+            if i in bf16_shards:
+                # BF16 shard: use dense linear
+                if bf16_weight is None:
+                    raise RuntimeError(
+                        f"EXL3 bf16 shard {i} but _exl3_bf16_weight is missing"
+                    )
+                bf16_idx = bf16_shards.index(i)
+                out_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
+                out_end = out_start + output_sizes[i]
+                w_shard = bf16_weight[out_start:out_end]
+                out = F.linear(x_2d, w_shard).to(dtype=torch.float32)
+                outputs.append(out)
+            else:
+                # EXL3 shard
+                linear = linears[i]
+                if linear is None:
+                    raise RuntimeError(f"EXL3 linear shard {i} is None")
+                out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
+                outputs.append(out)
+
+        # Concatenate shards along output dimension
+        if len(outputs) > 1:
+            y = torch.cat(outputs, dim=1)
+        else:
+            y = outputs[0]
+
+        # Cast back to input dtype
+        y = y.to(dtype=x.dtype)
+
+        # Add bias if provided
+        if bias is not None:
+            y = y + bias
+
+        # Restore original shape
+        if len(orig_shape) > 2:
+            y = y.reshape(*orig_shape[:-1], y.shape[-1])
+
+        return y

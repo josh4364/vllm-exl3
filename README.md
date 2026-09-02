@@ -51,7 +51,39 @@ wrong by construction:
   weights stay in the official source format (e.g. DeepSeek block-FP8),
   the declared quant method handles those layers; the exl3 method composes
   with it instead of forcing them unquantized. Omit for packs whose
-  non-routed weights are native BF16 (e.g. GLM-5.3-Flash).
+  non-routed weights are native BF16 (e.g. GLM-5.3-Flash). Declaring fp8
+  for BF16 tensors is not caught by vLLM: the layer boots with an
+  uninitialized `weight_scale_inv` and the model emits empty text.
+- `non_routed_dtype_policy: "bf16_as_stored"` *(optional)* — the dense
+  linears are plain BF16 and are never delegated, while
+  `non_routed_quantization` still serves source-format draft (MTP) experts
+  declared via `mtp_experts: "source"` + `mtp_experts_start_layer`. This is
+  the combination DeepSeek-V4-Flash packs need for speculative decoding.
+- `non_routed_exl3` *(optional)* — serves EXL3 tensors for the dense
+  (non-expert) linears too. Two forms, the explicit one wins:
+
+  ```json
+  "non_routed_exl3": {
+    "codebook": "mul1",
+    "layers": {
+      "language_model.model.layers.0.self_attn.o_proj": {"bits": 4},
+      "language_model.model.layers.0.self_attn.in_proj_qkvbfg_a": {"bits": 4, "bf16_shards": [3, 4, 5]},
+      "language_model.model.layers.0.mlp.gate_up_proj": {"bits": 3}
+    }
+  }
+  ```
+
+  `layers` keys are the module prefixes vLLM builds (after its weight-name
+  mapper, so for GLM-5.3-Flash the root is `language_model.model.`), not the
+  safetensors names. Fused modules take one entry; every EXL3 shard in a
+  fused module must share `bits`. `bf16_shards` lists the shards of a fused
+  module that stay BF16 and load from their `.weight` tensor (tensor
+  parallel size 1 only). The short form `{"modules": [...suffixes],
+  "bits": K, "layer_bits": {...}}` matches by module suffix. Each EXL3 shard
+  loads `.trellis/.suh/.svh` plus one `.mcg` or `.mul1` marker; a stale
+  BF16 `.weight` for an EXL3 shard is shape-checked and discarded, so a pack
+  may overlay EXL3 tensors on top of shards that still carry the BF16 copy.
+  `lm_head` is not covered yet.
 
 ## Install
 
@@ -106,5 +138,6 @@ Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
   `FusedMoE`/`FusedMoEMethodBase` alongside the fork's `RoutedExperts`, quant
   registration via `register_quantization_config`, non-routed delegation to
   stock `fp8`. GLM-5.3 remains fork-only until the architecture exists upstream.
+- Dense EXL3 for `lm_head` (`ParallelLMHead`) and TP>1 with `bf16_shards`.
 - Fat-expert prefill acceleration (sorted/batched expert dispatch) for extreme
   contexts.

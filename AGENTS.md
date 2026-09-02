@@ -18,8 +18,10 @@ through `exllamav3_ext` kernels. Canonical home of the plugin; the HF
 
 ## Layout
 - `src/vllm_exl3/exl3.py` — the whole plugin: `Exl3Config` (quant registration,
-  `layer_bits` per-layer bitrates, `non_routed_quantization` delegation),
-  `Exl3MoEMethod` (packed create/load/apply), fused-kernel dispatch with the
+  `layer_bits` per-layer bitrates, `non_routed_quantization` delegation,
+  `non_routed_exl3` dense-linear matching), `Exl3MoEMethod` (packed
+  create/load/apply), `Exl3LinearMethod` (dense EXL3 linears: per-shard
+  `LinearEXL3`, mixed EXL3/BF16 shards, stale `.weight` discard), fused-kernel dispatch with the
   fat-expert cap `TEMP_ROWS_FUSED` (2048 — do not lower it; 128 caused a
   >163k-token prefill stall via the per-expert fallback loop).
 - `src/glm53_exl3_plugin/` — deprecated compat shim. Must keep working for both
@@ -30,12 +32,20 @@ through `exllamav3_ext` kernels. Canonical home of the plugin; the HF
 `quantization_config`: `quant_method: "exl3"`, `bits`, `codebook: "mcg"`,
 optional `layer_bits` (per-layer overrides for mixed-bitrate packs), optional
 `non_routed_quantization` (dict of the source-format quant config for
-non-routed weights, e.g. DeepSeek block-FP8). A pack whose config declares a
+non-routed weights, e.g. DeepSeek block-FP8), optional `non_routed_exl3`
+(`layers` map keyed by vLLM module prefix with `bits` and `bf16_shards`, or
+the `modules`/`bits`/`layer_bits` suffix form; see README). `tools/dense_overlay.py`
+builds an overlay pack directory (symlinks + one extra safetensors file +
+rewritten index/config) from tensors that already exist in a full EXL3 quant;
+it moves tensors, it does not quantize. A pack whose config declares a
 different quant_method gets silently overridden by vLLM — always fix the pack
 config, never work around it in code.
 
 ## Build / test
 - `python -m build --wheel` (pure Python; must stay `py3-none-any`).
+- Dense-linear tests (need a GPU + exllamav3, no pytest):
+  `python tests/test_exl3_linear.py` prints `EXL3_LINEAR_TP_TEST PASS`,
+  `EXL3_LINEAR_TEST PASS`, `EXL3_LINEAR_MIXED_TEST PASS`.
 - Import gates after any packaging change:
   `python -c "import vllm_exl3; from glm53_exl3_plugin.exl3 import Exl3Config"`.
 - Real serving tests need a GB10 host with the fork runtime + exllamav3;
