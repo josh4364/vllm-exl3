@@ -580,7 +580,7 @@ def apply_exl3_batched_fat(
         mcg = bool(getattr(gate, "mcg", True))
         mul1 = bool(getattr(gate, "mul1", False))
 
-        if use_kernel and hasattr(ext, "exl3_fat_gemm"):
+        if use_kernel and k == 4 and hasattr(ext, "exl3_fat_gemm"):
             ext.exl3_fat_gemm(
                 h13, packed13, gate_up, svh13, k, mcg, mul1
             )
@@ -602,7 +602,7 @@ def apply_exl3_batched_fat(
 
         h2 = scratch["h2"][:n_rows]
         ext.had_r_128(act_h, h2, down.suh, None, 1.0)
-        if use_kernel and hasattr(ext, "exl3_fat_gemm_scatter"):
+        if use_kernel and k == 4 and hasattr(ext, "exl3_fat_gemm_scatter"):
             ext.exl3_fat_gemm_scatter(
                 h2,
                 down.trellis,
