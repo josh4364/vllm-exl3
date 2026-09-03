@@ -162,6 +162,27 @@ and will be removed in a future release.
 - [GLM-5.3-Flash EXL3 K2 on one DGX Spark](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe)
 - [GLM-5.3-Flash EXL3 K2/K3 mix on one DGX Spark](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe)
 
+## Credits and upstream work
+
+This project stands on other people's work, and two projects in particular.
+
+**[ExLlamaV3](https://github.com/turboderp/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)).** The EXL3 trellis format, the
+MCG codebook and the quantization method are theirs. The CUDA sources here build against ExLlamaV3's
+extension headers, and the GEMV and batched kernels reuse its kernel body. MIT, Copyright (c) 2025
+Turboderp.
+
+**[GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks)
+by Mia's AI Lab ([@MiaAI-Lab](https://github.com/MiaAI-Lab)), fat GEMM by [@plotarmordev](https://github.com/plotarmordev).** `csrc/exl3_fat_gemm.cu` and `csrc/exl3_fat_gemm.cuh` are copied from their
+`overlay/` directory with only include paths changed. Substantial portions of
+`src/vllm_exl3/exl3.py` derive from their `overlay/exl3.py`, which they published first. MIT,
+Copyright (c) 2026 Mia's AI Lab.
+
+Both licences require their notices to travel with the code. Those notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and must be retained on redistribution. Earlier
+releases of this repository carried this code without those notices; that was an oversight on our
+part and this section, the third-party notices file and the per-file headers correct it.
+
+
 ## License
 
 Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see

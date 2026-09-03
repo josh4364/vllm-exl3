@@ -1,3 +1,13 @@
+// Copied from Mia's AI Lab, GLM-5.3-Flash-EXL3-2x-DGX-Sparks,
+// overlay/exl3_fat_gemm.cu at commit 4b8d3c7 ("perf(exl3): accelerate fat-expert prefill").
+// https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
+//
+// Copyright (c) 2026 Mia's AI Lab. Licensed under the MIT License.
+// Full licence text: see THIRD_PARTY_NOTICES.md in the root of this repository.
+//
+// Modification from the original: three #include paths adjusted for this
+// project's source layout. The kernel is otherwise unchanged.
+
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>

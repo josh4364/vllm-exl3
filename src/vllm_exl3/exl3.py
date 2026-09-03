@@ -1,3 +1,14 @@
+"""Portions of this module derive from Mia's AI Lab, overlay/exl3.py in
+GLM-5.3-Flash-EXL3-2x-DGX-Sparks, first published 2026-08-27, which precedes this
+project. The routed-expert EXL3/MCG path, its pointer-table construction, expert-map
+pinning and diagnostic strings originate there.
+
+Copyright (c) 2026 Mia's AI Lab. MIT. See THIRD_PARTY_NOTICES.md.
+
+The EXL3 trellis format, the MCG codebook and the quantization method are ExLlamaV3's
+work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
+"""
+
 # SPDX-License-Identifier: Apache-2.0
 """EXL3/MCG trellis quantization for GLM-5.3-Flash routed experts.
 
