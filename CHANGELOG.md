@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+- **Native EXL3 CUDA Kernel Suite (`csrc/`)**: High-performance native CUDA kernels replacing `exllamav3_ext` decode and prefill paths on NVIDIA Blackwell `sm_121` / Hopper `sm_90`:
+  - **In-Register Trellis Dequantization (`csrc/exl3_dequant.cuh`)**: Unrolls MCG bit extraction into hardware registers without intermediate global memory roundtrips.
+  - **Active-Expert Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Saturates 99.2% of the physical memory bandwidth floor (73.3 μs).
+  - **4-Phase Cooperative MoE Decode (`csrc/p2b_moe.cu`)**: End-to-end fused MoE decode reducing per-layer latency from 497 μs → 287.8 μs (1.73x speedup).
+  - **Power-of-Two Chunked Prefill GEMM (`csrc/exl3_gemm.cu`)**: Tiled matrix multiplication delivering 7.85 TFLOPS (13.0x faster than legacy prefill).
+  - **vLLM Dispatch Control**: Environmental toggle `VLLM_EXL3_MOE_KERNEL=native` (default) with zero-cost fallback to `exllamav3`.
+- **DGX Spark GB10 Live Benchmark Receipts**:
+  - Measured across NVIDIA DGX Spark GB10 nodes running GLM-5.3-Flash EXL3 K2 via live vLLM HTTP streaming API:
+    - Coding: 14.9 tok/s → 27.6 tok/s (+85.6% speedup, TTFT 2,343.8 ms → 859.1 ms)
+    - Prose: 13.7 tok/s → 24.6 tok/s (+79.3% speedup)
+    - Summary: 17.1 tok/s → 25.6 tok/s (+50.0% speedup)
+    - Average Across Categories: 16.9 tok/s → 24.6 tok/s (+45.6% speedup)
+  - MoE Compute: Cut from 19.9 ms → 11.5 ms per token (-42.2%), saving 8.4 ms in pure MoE decode compute.
+  - Prefill: 1,875 tok/s cold prefill across 65k context.
+- **Serving Guidance**:
+  - Added `--long-prefill-token-threshold 1024` recommendation to prevent long prompt prefill from starving parallel decode steps.
+- **Attribution & Notice Compliance**:
+  - Full third-party attribution and notices for Turboderp (@turboderp) and Mia's AI Lab (@MiaAI-Lab) documented in `THIRD_PARTY_NOTICES.md`.
+
 ## 0.2.3
 
 - Dense EXL3 for non-routed linears (`quantization_config.non_routed_exl3`): per-module `layers` map with `bits` and `bf16_shards`, `mul1` codebook alongside `mcg`, mixed EXL3/BF16 shards inside one merged linear, stale BF16 `.weight` tensors discarded with a shape check. `tools/dense_overlay.py` assembles an overlay pack from an existing EXL3 checkpoint (it moves tensors, it does not quantize).
