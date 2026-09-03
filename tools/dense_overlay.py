@@ -10,6 +10,8 @@ vllm-exl3 reads. No shard of the source pack is rewritten and nothing is quantiz
     dense_overlay.py --branch 2.05bpw --src <pack> --out <overlay> --dry-run
     dense_overlay.py --branch 2.05bpw --src <pack> --out <overlay>
     dense_overlay.py --branch 2.05bpw --src <pack> --out <overlay> --verify
+    # stack the MTP draft layer on an existing overlay pack (draft module prefixes are model.layers.N)
+    dense_overlay.py --branch 2.05bpw --src <overlay> --out <overlay-mtp> --tag -mtp --skip-layers ""         --draft-layers 45 --draft-prefix-rewrite model.language_model.:model.
 """
 
 import argparse
@@ -201,8 +203,9 @@ def build_plan(args, local_idx, local_hdr, remote):
             continue
         fork_suffix, shard = FORK[suffix]
         key = layer_re + layer + "." + fork_suffix
-        if args.prefix_rewrite:
-            old, new = args.prefix_rewrite
+        rewrite = args.draft_prefix_rewrite if int(layer) in args.draft_layers else args.prefix_rewrite
+        if rewrite:
+            old, new = rewrite
             if key.startswith(old):
                 key = new + key[len(old):]
         entry = fork_keys.setdefault(key, {"bits": k})
@@ -276,10 +279,13 @@ def write_pack_meta(args, local_idx, plan, fork_keys, header, overlay_name, bran
     json.dump(idx, open(os.path.join(args.out, "model.safetensors.index.json"), "w"), indent=2)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
     q = cfg.setdefault("quantization_config", {})
+    # a source that is itself an overlay pack keeps its existing keys (stacked overlays)
+    layers = dict(q.get("non_routed_exl3", {}).get("layers", {}))
+    layers.update(fork_keys)
     q["non_routed_exl3"] = {
         "codebook": plan[0]["marker"],
         "source": "turboderp/GLM-5.3-Flash-exl3@" + branch,
-        "layers": {k: v for k, v in fork_keys.items()},
+        "layers": layers,
     }
     json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
 
@@ -332,7 +338,7 @@ def verify(args, plan, fork_keys, overlay_name, base_url):
                 bad.append("overlay tensor not indexed: %s.%s" % (e["base"], part))
     cfg = json.load(open(os.path.join(args.out, "config.json")))
     layers = cfg["quantization_config"].get("non_routed_exl3", {}).get("layers", {})
-    if layers != fork_keys:
+    if any(layers.get(k) != v for k, v in fork_keys.items()):
         bad.append("config layers block differs from plan (%d vs %d keys)" % (len(layers), len(fork_keys)))
     for b in bad[:20]:
         log("VERIFY_FAIL " + b)
@@ -350,6 +356,9 @@ def main():
     ap.add_argument("--root", default="model.language_model.", help="tensor-name root of the language model")
     ap.add_argument("--skip-layers", default="45", help="comma list of layer indices to leave untouched (MTP)")
     ap.add_argument("--prefix-rewrite", default=None, help="OLD:NEW rewrite of config key prefixes")
+    ap.add_argument("--draft-layers", default="", help="comma list of layers served by the MTP draft module")
+    ap.add_argument("--draft-prefix-rewrite", default=None, help="OLD:NEW rewrite of config key prefixes for --draft-layers")
+    ap.add_argument("--tag", default="", help="suffix for the overlay file name (stack a second overlay on an overlay pack)")
     ap.add_argument("--cache", default=os.path.expanduser("~/.cache/dense_overlay"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify", action="store_true")
@@ -357,8 +366,10 @@ def main():
     args = ap.parse_args()
     args.skip_layers = {int(x) for x in args.skip_layers.split(",") if x}
     args.prefix_rewrite = tuple(args.prefix_rewrite.split(":", 1)) if args.prefix_rewrite else None
+    args.draft_layers = {int(x) for x in args.draft_layers.split(",") if x}
+    args.draft_prefix_rewrite = tuple(args.draft_prefix_rewrite.split(":", 1)) if args.draft_prefix_rewrite else None
     base_url = REPO.format(branch=args.branch)
-    overlay_name = "dense-exl3-%s.safetensors" % args.branch
+    overlay_name = "dense-exl3-%s%s.safetensors" % (args.branch, args.tag)
 
     remote = remote_headers(base_url, os.path.join(args.cache, "%s-headers.json" % args.branch))
     if args.probe_remote_only:
