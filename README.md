@@ -26,7 +26,7 @@ forks). It also requires
 | Architecture | Status | Reference pack |
 |---|---|---|
 | `Glm5Next` (GLM-5.3-Flash) | serving-proven | GLM-5.3-Flash EXL3 K2 / K2K3-mix |
-| `DeepseekV4` (DeepSeek-V4-Flash) | serving-proven, needs fork-side loader adjustments for vision/MTP checkpoint extras | DSV4-Flash-Vision EXL3 MixedK |
+| `DeepseekV4` (DeepSeek-V4-Flash) | serving-proven on stock vLLM 0.28.0 (text, DSpark draft) and on the vLLM nightly vision class (text + images + DSpark draft, 64k context, tool calling); three small serving-side patches live in the recipe | DSV4-Flash-Vision EXL3 MixedK |
 
 ## Config contract
 
@@ -128,16 +128,17 @@ Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
 |---|---|
 | [GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2 on DGX Spark |
 | [GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2/K3 mix on DGX Spark |
-| [DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe) | DeepSeek-V4-Flash Vision EXL3 MixedK on DGX Spark |
+| [DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe) | DeepSeek-V4-Flash Vision EXL3 MixedK on DGX Spark: stock 0.28.0 and nightly vision routes, DSpark speculative decoding, tool calling, remote vision test guide |
 | [GLM-5.3-Flash-EXL3-K2-spark-vllm](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2-spark-vllm) | Prebuilt vLLM runtime wheels |
 
 
 ## Roadmap
 
-- **0.3.0 — stock vLLM support (DeepSeek-V4 first).** Compat layer for stock's
-  `FusedMoE`/`FusedMoEMethodBase` alongside the fork's `RoutedExperts`, quant
-  registration via `register_quantization_config`, non-routed delegation to
-  stock `fp8`. GLM-5.3 remains fork-only until the architecture exists upstream.
+- **Stock vLLM (DeepSeek-V4): done in 0.2.3.** The `bf16_as_stored` policy plus
+  the recipe's three loader patches serve the DSV4 packs on stock 0.28.0 and on
+  the nightly vision class. Upstreaming those patches and the `FusedMoE` compat
+  layer for other architectures is next; GLM-5.3 remains fork-only until the
+  architecture exists upstream.
 - Dense EXL3 for `lm_head` (`ParallelLMHead`) and TP>1 with `bf16_shards`.
 - Fat-expert prefill acceleration (sorted/batched expert dispatch) for extreme
   contexts.
