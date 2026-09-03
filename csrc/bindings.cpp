@@ -7,6 +7,7 @@
 #include "exl3_dequant.cuh"
 #include "p2b_batched.cuh"
 #include "p2b_moe.cuh"
+#include "exl3_gemm.cuh"
 
 namespace {
 
@@ -105,6 +106,13 @@ at::Tensor exl3_gemv_cuda(const at::Tensor& x, const at::Tensor& trellis,
                           const at::Tensor& suh, const at::Tensor& svh,
                           int64_t bits, bool mcg, int64_t mmode);
 
+at::Tensor exl3_gemm(const at::Tensor& x, const at::Tensor& trellis,
+                     const at::Tensor& suh, const at::Tensor& svh,
+                     int64_t bits, bool mcg) {
+    return exl3_gemm_cuda(x.contiguous().view({x.numel() / x.size(-1), x.size(-1)}),
+                          trellis, suh, svh, bits, mcg);
+}
+
 at::Tensor dequant_trellis(const at::Tensor& trellis, const at::Tensor& suh,
                            const at::Tensor& svh, int64_t bits, bool mcg) {
     TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 8,
@@ -162,6 +170,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Native small-m EXL3 GEMV", py::arg("x"), py::arg("trellis"),
           py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("mcg"),
           py::arg("mmode") = 1);
+    m.def("exl3_gemm", &exl3_gemm, "Native tiled EXL3 GEMM",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"),
+          py::arg("K"), py::arg("mcg"));
     m.def("p2b_gemv_batched", &p2b_gemv_batched,
           "Batched cooperative MoE EXL3 GEMV", py::arg("x"),
           py::arg("trellis_ptrs"), py::arg("suh_ptrs"), py::arg("svh_ptrs"),
