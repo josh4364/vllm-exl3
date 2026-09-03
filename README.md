@@ -33,9 +33,9 @@ Version `0.3.0` introduces custom native CUDA kernels (`csrc/`) replacing the st
 
 ### Live Head-to-Head Benchmark Receipts
 
-Measured simultaneously across two physical NVIDIA DGX Spark GB10 machines (`cruz-spark` Baseline ExLlamaV3 vs. `wesche-spark-9f73` Native EXL3) running `GLM-5.3-Flash-EXL3-K2` via live vLLM HTTP streaming API:
+Measured simultaneously across two physical NVIDIA DGX Spark GB10 nodes (Baseline ExLlamaV3 vs. Native EXL3) running `GLM-5.3-Flash-EXL3-K2` via live vLLM HTTP streaming API:
 
-| Category | Baseline (`cruz-spark`) | Native EXL3 (`9f73`) | Baseline TTFT | Native TTFT | Net Speedup |
+| Category | Baseline ExLlamaV3 | Native EXL3 | Baseline TTFT | Native TTFT | Net Speedup |
 |---|---|---|---|---|:---:|
 | **Coding** | 14.9 tok/s | **27.6 tok/s** | 2,343.8 ms | **859.1 ms** | **+85.6%** |
 | **Prose** | 13.7 tok/s | **24.6 tok/s** | 355.4 ms | **308.7 ms** | **+79.3%** |
