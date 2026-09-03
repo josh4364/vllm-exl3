@@ -6,6 +6,7 @@
 
 #include "exl3_dequant.cuh"
 #include "p2b_batched.cuh"
+#include "p2b_moe.cuh"
 
 namespace {
 
@@ -145,6 +146,15 @@ at::Tensor p2b_gemv_batched(const at::Tensor& x, const at::Tensor& trellis_ptrs,
                                  expert_indices, bits, mcg, mmode);
 }
 
+at::Tensor p2b_fused_moe(const at::Tensor& x, at::Tensor& out,
+                         const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
+                         const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
+                         const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
+                         const at::Tensor& ids, const at::Tensor& rw,
+                         int64_t kg, int64_t ku, int64_t kd, bool mcg) {
+    return p2b_fused_moe_cuda(x, out, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, kg, ku, kd, mcg);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequant_trellis", &dequant_trellis,
           "Decode an EXL3 trellis tensor into an fp16 weight matrix");
@@ -157,4 +167,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("trellis_ptrs"), py::arg("suh_ptrs"), py::arg("svh_ptrs"),
           py::arg("expert_indices"), py::arg("K"), py::arg("mcg"),
           py::arg("mmode") = 1);
+    m.def("p2b_fused_moe", &p2b_fused_moe,
+          "Fused cooperative MoE decode", py::arg("x"), py::arg("out"),
+          py::arg("gate_trellis_ptrs"), py::arg("gate_suh_ptrs"), py::arg("gate_svh_ptrs"),
+          py::arg("up_trellis_ptrs"), py::arg("up_suh_ptrs"), py::arg("up_svh_ptrs"),
+          py::arg("down_trellis_ptrs"), py::arg("down_suh_ptrs"), py::arg("down_svh_ptrs"),
+          py::arg("expert_indices"), py::arg("routing_weights"), py::arg("K_gate"),
+          py::arg("K_up"), py::arg("K_down"), py::arg("mcg"));
 }

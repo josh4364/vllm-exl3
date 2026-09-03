@@ -6,15 +6,9 @@
 #include "util.h"
 #include "util.cuh"
 
-// Turn the proven QTIP kernel template into a callable device routine.  Its
-// grid.sync() points at the parent cooperative grid, so every block executes
-// the same expert loop and all synchronization remains valid.
-#define __global__ __device__
-#define __launch_bounds__(...)
-#include "quant/exl3_gemv_kernel.cuh"
-#undef __launch_bounds__
-#undef __global__
-#define __global__ __global__
+#define EXL3_GEMM_ARGS const half*, const uint16_t*, void*, const int, const int, const int, int*, const half*, half*, const half*
+template <int, bool, int, int, int, bool>
+__device__ void exl3_gemv_kernel(EXL3_GEMM_ARGS);
 
 template <int BITS, int CB>
 __global__ __launch_bounds__(512)
@@ -42,6 +36,13 @@ void p2b_worklist_kernel(const half* A, const uint16_t** tptrs,
             locks + e * (1 << 20), su, ah, sv);
     }
 }
+
+// Instantiate the proven QTIP body as a device-callable template.
+#define __global__ __device__
+#define __launch_bounds__(...)
+#include "quant/exl3_gemv_kernel.cuh"
+#undef __launch_bounds__
+#undef __global__
 
 template <int BITS, int CB>
 void launch_batched(const at::Tensor& x, const at::Tensor& tp,
