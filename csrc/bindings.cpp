@@ -25,15 +25,49 @@ at::Tensor dequant_cpu(const at::Tensor& trellis, const at::Tensor& suh,
     const std::size_t words = static_cast<std::size_t>(16 * bits);
     std::vector<float> matrix(static_cast<std::size_t>(rows * cols), 0.0f);
 
+    // Each packed 16*K tile is decoded by eight logical warps in the native
+    // kernel.  A warp's 32 lanes produce eight values each; the lane+4
+    // shuffle then interleaves those values into the 16x16 row-major tile.
+    // Reproduce that tensor-core fragment swizzle on the host so the extension
+    // has the same bit layout as reconstruct_had_slice.
     for (int64_t kt = 0; kt < packed.size(0); ++kt) {
         for (int64_t nt = 0; nt < packed.size(1); ++nt) {
             const auto* tile = reinterpret_cast<const std::uint16_t*>(
                 p + (kt * packed.size(1) + nt) * words);
-            for (int i = 0; i < 256; ++i) {
-                const int64_t r = kt * 16 + i / 16;
-                const int64_t c = nt * 16 + i % 16;
-                matrix[static_cast<std::size_t>(r * cols + c)] =
-                    vllm_exl3::decode_weight(tile, words, i, static_cast<int>(bits), mcg);
+            std::array<std::array<std::uint16_t, 8>, 32> lane{};
+            for (int l = 0; l < 32; ++l) {
+                for (int j = 0; j < 8; ++j) {
+                    const std::size_t start = (static_cast<std::size_t>(l * 8 + j) + 257u) *
+                                              static_cast<int>(bits) - 16u;
+                    const auto window = vllm_exl3::read_window(tile, words, start);
+                    lane[l][j] = vllm_exl3::decode_codebook_bits(
+                        window, mcg ? 1 : 2);
+                }
+            }
+            for (int l = 0; l < 32; ++l) {
+                if (l & 4) continue;
+                const int row0 = (l % 4) * 2;
+                const int row2 = row0 + 8;
+                const int col0 = (l / 8) * 2;
+                const int col4 = col0 + 8;
+                const auto emit = [&](int row, int col, int a, int b) {
+                    matrix[static_cast<std::size_t>((kt * 16 + row) * cols +
+                                                     nt * 16 + col)] =
+                        vllm_exl3::half_bits_to_float(a);
+                    matrix[static_cast<std::size_t>((kt * 16 + row) * cols +
+                                                     nt * 16 + col + 1)] =
+                        vllm_exl3::half_bits_to_float(b);
+                };
+                const auto& own = lane[l];
+                const auto& peer = lane[l + 4];
+                emit(row0, col0, own[0], peer[0]);
+                emit(row0 + 1, col0, own[1], peer[1]);
+                emit(row2, col0, own[2], peer[2]);
+                emit(row2 + 1, col0, own[3], peer[3]);
+                emit(row0, col4, own[4], peer[4]);
+                emit(row0 + 1, col4, own[5], peer[5]);
+                emit(row2, col4, own[6], peer[6]);
+                emit(row2 + 1, col4, own[7], peer[7]);
             }
         }
     }
@@ -63,6 +97,12 @@ at::Tensor dequant_cpu(const at::Tensor& trellis, const at::Tensor& suh,
 
 }  // namespace
 
+// CUDA implementation is compiled from exl3_gemv.cu.  Keeping the declaration
+// here also lets CPU-only builds retain a functional reference fallback.
+at::Tensor exl3_gemv_cuda(const at::Tensor& x, const at::Tensor& trellis,
+                          const at::Tensor& suh, const at::Tensor& svh,
+                          int64_t bits, bool mcg, int64_t mmode);
+
 at::Tensor dequant_trellis(const at::Tensor& trellis, const at::Tensor& suh,
                            const at::Tensor& svh, int64_t bits, bool mcg) {
     TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 8,
@@ -80,7 +120,26 @@ at::Tensor dequant_trellis(const at::Tensor& trellis, const at::Tensor& suh,
     return device.is_cpu() ? result : result.to(device);
 }
 
+at::Tensor exl3_gemv(const at::Tensor& x, const at::Tensor& trellis,
+                     const at::Tensor& suh, const at::Tensor& svh,
+                     int64_t bits, bool mcg, int64_t mmode) {
+    TORCH_CHECK(x.dim() >= 2, "x must have shape [..., in_features]");
+    const int64_t m = x.numel() / x.size(-1);
+    TORCH_CHECK(m >= 1 && m <= 8, "native GEMV supports 1 <= m <= 8");
+    TORCH_CHECK(x.size(-1) == trellis.size(0) * 16,
+                "x feature dimension does not match trellis");
+    TORCH_CHECK(mmode == 0 || mmode == 1, "mmode must be 0 or 1");
+    auto x2 = x.contiguous().view({m, x.size(-1)});
+    if (x.is_cuda()) return exl3_gemv_cuda(x2, trellis, suh, svh, bits, mcg, mmode);
+    auto w = dequant_trellis(trellis, suh, svh, bits, mcg);
+    return at::mm(x2.to(at::kFloat), w.to(at::kFloat)).to(x.scalar_type());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequant_trellis", &dequant_trellis,
           "Decode an EXL3 trellis tensor into an fp16 weight matrix");
+    m.def("exl3_gemv", &exl3_gemv,
+          "Native small-m EXL3 GEMV", py::arg("x"), py::arg("trellis"),
+          py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("mcg"),
+          py::arg("mmode") = 1);
 }

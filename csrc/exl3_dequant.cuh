@@ -53,6 +53,44 @@ inline std::uint16_t float_to_half_bits(float value) {
         (static_cast<std::uint32_t>(exp + 15) << 10) | (mant >> 13));
 }
 
+inline std::uint16_t half_add_bits(std::uint16_t a, std::uint16_t b) {
+    return float_to_half_bits(half_bits_to_float(a) + half_bits_to_float(b));
+}
+
+inline std::uint16_t half_mul_bits(std::uint16_t a, std::uint16_t b) {
+    return float_to_half_bits(half_bits_to_float(a) * half_bits_to_float(b));
+}
+
+inline std::uint16_t half_fma_bits(std::uint16_t a, std::uint16_t b,
+                                   std::uint16_t c) {
+    return float_to_half_bits(half_bits_to_float(a) * half_bits_to_float(b) +
+                              half_bits_to_float(c));
+}
+
+// EXL3's three procedural codebooks.  The CUDA implementation returns half at
+// every codebook operation; retaining those roundings here is important for
+// parity with the native kernel.
+inline std::uint16_t decode_codebook_bits(std::uint16_t window, int cb) {
+    std::uint32_t x = window;
+    if (cb == 0) {
+        x = x * 89226354u + 64248484u;
+        x = lop3_6a(x, 0x8fff8fffu, 0x3b603b60u);
+        return half_add_bits(static_cast<std::uint16_t>(x),
+                             static_cast<std::uint16_t>(x >> 16));
+    }
+    if (cb == 1) {
+        x *= MCG_MULTIPLIER;
+        x = lop3_6a(x, 0x8fff8fffu, 0x3b603b60u);
+        return half_add_bits(static_cast<std::uint16_t>(x),
+                             static_cast<std::uint16_t>(x >> 16));
+    }
+    // cb == 2 (MUL1): byte dot product followed by half FMA.
+    x *= MUL1_MULTIPLIER;
+    const std::uint32_t sum = 0x6400u + (x & 0xffu) + ((x >> 8) & 0xffu) +
+                               ((x >> 16) & 0xffu) + ((x >> 24) & 0xffu);
+    return half_fma_bits(static_cast<std::uint16_t>(sum), 0x1eeeu, 0xc931u);
+}
+
 inline float decode_mcg(std::uint16_t window) {
     std::uint32_t x = static_cast<std::uint32_t>(window) * MCG_MULTIPLIER;
     x = lop3_6a(x, 0x8fff8fffu, 0x3b603b60u);
@@ -70,19 +108,29 @@ inline float decode_mul1(std::uint16_t window) {
 
 inline std::uint16_t read_window(const std::uint16_t* packed, std::size_t words,
                                  std::size_t bit) {
+    // The packed stream is addressed as uint32 words by EXL3's dq helpers.
+    // Reproduce their funnel-shift window exactly instead of treating each
+    // uint16 as an independently wrapped scalar word.
     bit %= words * 16;
-    const std::size_t word = bit / 16;
-    const unsigned shift = static_cast<unsigned>(bit & 15u);
-    const std::uint32_t a = packed[word];
-    const std::uint32_t b = packed[(word + 1) % words];
-    return static_cast<std::uint16_t>((a >> shift) | (b << ((16 - shift) & 15)));
+    const std::size_t b0 = bit;
+    const std::size_t b1 = b0 + 16;
+    const std::size_t n32 = words / 2;
+    const std::size_t i0 = (b0 / 32) % n32;
+    const std::size_t i1 = ((b1 - 1) / 32) % n32;
+    const unsigned shift = static_cast<unsigned>((i1 + 1) * 32 - b1);
+    const std::uint32_t a = static_cast<std::uint32_t>(packed[2 * i0]) |
+                            (static_cast<std::uint32_t>(packed[2 * i0 + 1]) << 16);
+    const std::uint32_t b = static_cast<std::uint32_t>(packed[2 * i1]) |
+                            (static_cast<std::uint32_t>(packed[2 * i1 + 1]) << 16);
+    const std::uint64_t merged = (static_cast<std::uint64_t>(a) << 32) | b;
+    return static_cast<std::uint16_t>((merged >> shift) & 0xffffu);
 }
 
 inline float decode_weight(const std::uint16_t* packed, std::size_t words,
                            int index, int bits, bool mcg) {
     const std::size_t start = (static_cast<std::size_t>(index) + 257u) * bits - 16u;
     const std::uint16_t window = read_window(packed, words, start);
-    return mcg ? decode_mcg(window) : decode_mul1(window);
+    return half_bits_to_float(decode_codebook_bits(window, mcg ? 1 : 2));
 }
 
 inline void hadamard(float* values, int n) {
@@ -119,11 +167,17 @@ __device__ __forceinline__ std::uint32_t device_lop3_6a(std::uint32_t a,
 __device__ __forceinline__ std::uint16_t device_read_window(
     const std::uint16_t* packed, int words, std::size_t bit) {
     bit %= static_cast<std::size_t>(words * 16);
-    const int word = static_cast<int>(bit / 16);
-    const unsigned shift = static_cast<unsigned>(bit & 15u);
-    const std::uint32_t a = packed[word];
-    const std::uint32_t b = packed[(word + 1) % words];
-    return static_cast<std::uint16_t>((a >> shift) | (b << ((16 - shift) & 15)));
+    const std::size_t b1 = bit + 16;
+    const int n32 = words / 2;
+    const int i0 = static_cast<int>((bit / 32) % n32);
+    const int i1 = static_cast<int>(((b1 - 1) / 32) % n32);
+    const unsigned shift = static_cast<unsigned>((i1 + 1) * 32 - b1);
+    const std::uint32_t a = static_cast<std::uint32_t>(packed[2 * i0]) |
+                            (static_cast<std::uint32_t>(packed[2 * i0 + 1]) << 16);
+    const std::uint32_t b = static_cast<std::uint32_t>(packed[2 * i1]) |
+                            (static_cast<std::uint32_t>(packed[2 * i1 + 1]) << 16);
+    const std::uint64_t merged = (static_cast<std::uint64_t>(a) << 32) | b;
+    return static_cast<std::uint16_t>((merged >> shift) & 0xffffu);
 }
 
 template <bool MCG>
