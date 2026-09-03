@@ -4,6 +4,19 @@
 
 [![Follow on X](https://img.shields.io/badge/Follow-%40ViC305-black?logo=x)](https://x.com/ViC305) [![Follow on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Follow-vcruz305-yellow)](https://huggingface.co/vcruz305)
 
+> ### Built on the work of others
+>
+> The EXL3 trellis format, the MCG codebook and the quantization method are [ExLlamaV3](https://github.com/turboderp/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)). This plugin
+> exists to serve their format.
+>
+> `csrc/exl3_fat_gemm.cu` and `.cuh` are **copied from** [Mia's AI Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) ([@MiaAI-Lab](https://github.com/MiaAI-Lab), [@plotarmordev](https://github.com/plotarmordev)), with only include paths changed, and
+> substantial portions of `src/vllm_exl3/exl3.py` are **derived from** their `overlay/exl3.py`, which
+> they published first.
+>
+> Both projects are MIT licensed. Their notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+> and must be kept with the code. Earlier releases here shipped without those notices, which was our
+> mistake. Thank you to both projects for the work this is built on.
+
 An out-of-tree vLLM plugin that registers `--quantization exl3`, serving
 EXL3 (ExLlamaV3 trellis, MCG codebook) quantized packs — routed MoE experts
 run packed through `exllamav3_ext` kernels, never dequantized to a dense
