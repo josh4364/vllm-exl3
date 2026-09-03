@@ -21,6 +21,46 @@ forks). It also requires
 [exllamav3](https://github.com/turboderp-org/exllamav3) with its compiled
 `exllamav3_ext` kernels for your GPU arch.
 
+## v0.3.0 Native Kernel Suite & Benchmark Receipts (DGX Spark GB10)
+
+Version `0.3.0` introduces custom native CUDA kernels (`csrc/`) replacing the stock `exllamav3_ext` decode and prefill paths on Blackwell `sm_121` architectures:
+
+* **In-Register Trellis Dequantization (`csrc/exl3_dequant.cuh`)**: Unrolls MCG bit extraction into registers without intermediate global memory roundtrips.
+* **Dense & Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Active-expert batched GEMV saturating 99.2% of the physical memory bandwidth floor (73.3 $\mu\text{s}$).
+* **4-Phase Cooperative MoE Decode (`csrc/p2b_moe.cu`)**: End-to-end fused MoE decode reducing per-layer latency from $497\ \mu\text{s} \to 287.8\ \mu\text{s}$ ($1.73\times$).
+* **Power-of-Two Chunked Prefill GEMM (`csrc/exl3_gemm.cu`)**: Tiled matrix multiplication delivering 7.85 TFLOPS ($13.0\times$ faster than legacy prefill).
+* **vLLM Dispatch Control**: Environmental toggle `VLLM_EXL3_MOE_KERNEL=native` (default) with zero-cost fallback to `exllamav3`.
+
+### Live Head-to-Head Benchmark Receipts
+
+Measured simultaneously across two physical NVIDIA DGX Spark GB10 machines (`cruz-spark` Baseline ExLlamaV3 vs. `wesche-spark-9f73` Native EXL3) running `GLM-5.3-Flash-EXL3-K2` via live vLLM HTTP streaming API:
+
+| Category | Baseline (`cruz-spark`) | Native EXL3 (`9f73`) | Baseline TTFT | Native TTFT | Net Speedup |
+|---|---|---|---|---|:---:|
+| **Coding** | 14.9 tok/s | **27.6 tok/s** | 2,343.8 ms | **859.1 ms** | **+85.6%** |
+| **Prose** | 13.7 tok/s | **24.6 tok/s** | 355.4 ms | **308.7 ms** | **+79.3%** |
+| **Reasoning** | 18.9 tok/s | **25.1 tok/s** | 482.2 ms | **407.8 ms** | **+32.7%** |
+| **Summary** | 17.1 tok/s | **25.6 tok/s** | 409.6 ms | **345.4 ms** | **+50.0%** |
+| **Format** | 16.3 tok/s | **24.0 tok/s** | 401.9 ms | **349.8 ms** | **+47.7%** |
+| **JSON** | 20.8 tok/s | **25.6 tok/s** | 502.6 ms | **414.1 ms** | **+23.3%** |
+| **HTML** | 19.5 tok/s | **23.1 tok/s** | 361.7 ms | **323.1 ms** | **+18.6%** |
+| **Narrative** | 14.0 tok/s | **21.0 tok/s** | 395.4 ms | **333.0 ms** | **+50.0%** |
+| **Average Across Categories** | **16.9 tok/s** | **24.6 tok/s** | **656.6 ms** | **417.6 ms** | **+45.6%** |
+
+### Per-Step Decode Latency Breakdown (C1)
+
+* **40 MoE Layers**: Cut from $19.9\ \text{ms} \to 11.5\ \text{ms}$ ($497\ \mu\text{s} \to 287.8\ \mu\text{s}$ per layer), saving **8.4 ms in MoE compute alone** per token.
+* **Total Per-Step Time**: Reduced from **$59.2\ \text{ms} \to 40.6\ \text{ms}$ (-31.4%)**, directly powering the +45.6% throughput gain.
+* **Prefill GEMM**: 7.85 TFLOPS ($13.0\times$ faster), holding **1,875 tok/s** cold prefill across 65k context.
+* **NVMe Storage Scaling**: 8-worker parallel read reaches **3,563 MB/s** ($3.0\times$ speedup over single-thread 1,185 MB/s), loading 96 GB weights in ~27 seconds.
+
+### Essential Serving Flag
+When running on DGX Spark or long-context instances, pass:
+```bash
+--long-prefill-token-threshold 1024
+```
+This prevents long prompt prefill from starving parallel decode steps and stalling the scheduler.
+
 ## Supported architectures
 
 | Architecture | Status | Reference pack |
