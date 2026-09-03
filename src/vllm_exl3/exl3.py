@@ -154,6 +154,50 @@ def load_exllamav3_ext():
     return exllamav3_ext
 
 
+def _load_native_exl3_ext():
+    """Return the optional native extension, without making it a hard dependency."""
+    try:
+        module = importlib.import_module("vllm_exl3_c")
+    except Exception:
+        return None
+    return module if callable(getattr(module, "p2b_fused_moe", None)) else None
+
+
+def native_moe_kernel_available() -> bool:
+    """Whether the compiled cooperative native MoE entry point is available."""
+    return _load_native_exl3_ext() is not None
+
+
+def _exllamav3_moe_available() -> bool:
+    try:
+        return callable(getattr(load_exllamav3_ext(), "exl3_moe", None))
+    except Exception:
+        return False
+
+
+def get_moe_kernel_backend() -> str:
+    """Resolve ``VLLM_EXL3_MOE_KERNEL`` to the requested/available backend.
+
+    ``native`` and ``exllamav3`` are intentionally returned as requested even
+    when their optional extension is absent.  The dispatch function then applies
+    the documented graceful fallback; this makes configuration introspection
+    deterministic and avoids importing CUDA extensions during config parsing.
+    """
+    requested = os.environ.get("VLLM_EXL3_MOE_KERNEL", "auto").strip().lower()
+    if requested not in {"native", "exllamav3", "auto"}:
+        logger.warning(
+            "Unknown VLLM_EXL3_MOE_KERNEL=%r; using auto selection", requested
+        )
+        requested = "auto"
+    if requested != "auto":
+        return requested
+    if native_moe_kernel_available():
+        return "native"
+    if _exllamav3_moe_available():
+        return "exllamav3"
+    return "loop"
+
+
 def _exl3_moe_accepts_num_active(fn) -> bool:
     try:
         import inspect
@@ -247,7 +291,10 @@ def apply_exl3_python_loop(
 
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
-    import exllamav3_ext
+    try:
+        exllamav3_ext = load_exllamav3_ext()
+    except Exception:
+        exllamav3_ext = None
 
     device = layer.w13_trellis.device
     n_exp = len(inners)
@@ -272,10 +319,34 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         "down_suh": _ptrs("down", "suh"),
         "down_svh": _ptrs("down", "svh"),
     }
+    # Short aliases match the native extension terminology and keep the table
+    # ABI stable for callers that construct their own RoutedExperts wrapper.
+    layer._exl3_ptrs.update(
+        {
+            "gate_t_ptrs": layer._exl3_ptrs["gate_trellis"],
+            "gate_suh_ptrs": layer._exl3_ptrs["gate_suh"],
+            "gate_svh_ptrs": layer._exl3_ptrs["gate_svh"],
+            "up_t_ptrs": layer._exl3_ptrs["up_trellis"],
+            "up_suh_ptrs": layer._exl3_ptrs["up_suh"],
+            "up_svh_ptrs": layer._exl3_ptrs["up_svh"],
+            "down_t_ptrs": layer._exl3_ptrs["down_trellis"],
+            "down_suh_ptrs": layer._exl3_ptrs["down_suh"],
+            "down_svh_ptrs": layer._exl3_ptrs["down_svh"],
+        }
+    )
     idx = int(device.index) if device.index is not None else 0
-    concurrency = int(exllamav3_ext.exl3_moe_max_concurrency(idx))
-    if concurrency < 1:
-        concurrency = 1
+    if exllamav3_ext is not None and hasattr(
+        exllamav3_ext, "exl3_moe_max_concurrency"
+    ):
+        concurrency = int(exllamav3_ext.exl3_moe_max_concurrency(idx))
+        if concurrency < 1:
+            concurrency = 1
+    else:
+        # Native p2b does not consume ExLlamaV3 scratch buffers.
+        layer._exl3_fused_temps = None
+        layer._exl3_fused_concurrency = 0
+        layer._exl3_k = int(layer._exl3_bits)
+        return
     key = (str(device), hidden, intermediate, concurrency)
     temps = _FUSED_TEMP_CACHE.get(key)
     if temps is None:
@@ -291,6 +362,108 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_k = int(layer._exl3_bits)
 
 
+def _native_moe_dimensions_supported(
+    x2d: torch.Tensor, layer: torch.nn.Module, inners: list[dict[str, Any]]
+) -> bool:
+    """The current native fused kernel is specialized to the DSV4/GLM5 tile."""
+    hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
+    inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
+    return (
+        x2d.is_cuda
+        and x2d.dim() == 2
+        and 1 <= int(x2d.shape[0]) <= 8
+        and int(x2d.shape[1]) == hidden_meta == 4096
+        and inter_meta == 2048
+        and int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+        in (2, 3, 4)
+        and len(inners) > 0
+    )
+
+
+def _apply_native_fused_moe(
+    x2d: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    layer: torch.nn.Module,
+    inners: list[dict[str, Any]],
+    expert_map: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Run the native cooperative kernel for decode rows when it is safe.
+
+    The native ABI consumes one input row and one routing list per launch.  A
+    decode batch is therefore submitted as row views into one preallocated
+    output tensor.  No per-token pointer/weight tensors are allocated; the only
+    conversion is one contiguous int32 routing table for the complete batch.
+    Invalid/non-local IDs are clamped to a valid pointer and receive zero
+    routing weight, preventing an out-of-bounds read while preserving fallback
+    semantics.
+    """
+    module = _load_native_exl3_ext()
+    if module is None or not _native_moe_dimensions_supported(x2d, layer, inners):
+        return None
+    ptrs = getattr(layer, "_exl3_ptrs", None)
+    if not isinstance(ptrs, dict):
+        return None
+    required = (
+        "gate_trellis",
+        "gate_suh",
+        "gate_svh",
+        "up_trellis",
+        "up_suh",
+        "up_svh",
+        "down_trellis",
+        "down_suh",
+        "down_svh",
+    )
+    if any(key not in ptrs for key in required):
+        return None
+
+    n_exp = len(inners)
+    local = map_topk_to_local(ids, n_exp, expert_map)
+    topk = int(local.shape[-1])
+    if topk < 1:
+        return None
+    # p2b_fused_moe reads int32 IDs and fp16 routing weights.  Clamp before
+    # conversion so the invalid sentinel cannot wrap into a large int32 value.
+    safe_ids = local.clamp(min=0, max=n_exp - 1).to(dtype=torch.int32).contiguous()
+    valid = (local >= 0) & (local < n_exp)
+    safe_weights = (
+        weights.reshape_as(local)
+        .to(dtype=torch.float16)
+        .mul(valid.to(dtype=torch.float16))
+        .contiguous()
+    )
+    xh = x2d.to(dtype=torch.float16).contiguous()
+    native_out = torch.empty_like(xh)
+    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
+    fn = module.p2b_fused_moe
+    for row in range(int(x2d.shape[0])):
+        result = fn(
+            xh[row : row + 1],
+            native_out[row : row + 1],
+            ptrs["gate_trellis"],
+            ptrs["gate_suh"],
+            ptrs["gate_svh"],
+            ptrs["up_trellis"],
+            ptrs["up_suh"],
+            ptrs["up_svh"],
+            ptrs["down_trellis"],
+            ptrs["down_suh"],
+            ptrs["down_svh"],
+            safe_ids[row],
+            safe_weights[row],
+            k,
+            k,
+            k,
+            True,
+        )
+        # pybind returns the same output tensor, while lightweight test doubles
+        # may return a fresh tensor.  Accommodate both without synchronizing.
+        if isinstance(result, torch.Tensor) and result is not native_out:
+            native_out[row : row + 1].copy_(result.reshape(1, -1))
+    return native_out.to(dtype=torch.float32)
+
+
 def apply_exl3_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -301,10 +474,37 @@ def apply_exl3_fused_moe(
     limit: float,
 ) -> torch.Tensor:
     """One exl3_moe launch per layer. Experts with count > 128 fall back to LinearEXL3."""
-    import exllamav3_ext
-
     tokens, hidden = x2d.shape
     n_exp = len(inners)
+
+    # Keep this entry point independently usable by callers that bypass
+    # ``apply_exl3_experts`` (for example, custom vLLM runners).
+    if get_moe_kernel_backend() == "native":
+        try:
+            native_out = _apply_native_fused_moe(
+                x2d, ids, weights, layer, inners, expert_map
+            )
+        except Exception as exc:
+            native_out = None
+            layer._exl3_native_error = repr(exc)
+            logger.warning_once(
+                "Native EXL3 MoE dispatch failed in fused entry point; "
+                "falling back to ExLlamaV3/Python: %s",
+                exc,
+            )
+        if native_out is not None:
+            layer._exl3_last_apply = "native"
+            return native_out
+
+    try:
+        import exllamav3_ext
+    except Exception:
+        # Direct callers may use this helper without installing ExLlamaV3.
+        # Keep the same graceful fallback contract as ``apply_exl3_experts``.
+        return apply_exl3_python_loop(
+            x2d, ids, weights, inners, expert_map, limit
+        )
+
     ptrs = getattr(layer, "_exl3_ptrs", None)
     temps = getattr(layer, "_exl3_fused_temps", None)
     if not ptrs or temps is None:
@@ -419,6 +619,29 @@ def apply_exl3_experts(
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
     expert_map = pin_exl3_expert_map(layer, x2d.device)
+
+    # Native p2b is a decode-only path.  It is selected explicitly with
+    # ``native`` or automatically when the optional extension is installed;
+    # unsupported shapes and launch failures fall through to the established
+    # ExLlamaV3/Python implementations below.
+    backend = get_moe_kernel_backend()
+    if backend == "native" and (fused is not False):
+        try:
+            native_out = _apply_native_fused_moe(
+                x2d, ids, weights, layer, inners, expert_map
+            )
+        except Exception as exc:
+            native_out = None
+            layer._exl3_native_error = repr(exc)
+            logger.warning_once(
+                "Native EXL3 MoE dispatch failed; falling back to %s: %s",
+                "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
+                exc,
+            )
+        if native_out is not None:
+            layer._exl3_last_apply = "native"
+            return native_out.to(dtype=x.dtype)
+
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
@@ -905,15 +1128,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer._exl3_inners = inners
         fused_ok = False
         fused_err = None
-        if fused_moe_enabled():
+        # Native dispatch has its own environment control and must still build
+        # pointer tables when the legacy EXL3_FUSED_MOE switch is disabled.
+        backend = get_moe_kernel_backend()
+        if fused_moe_enabled() or backend == "native":
             try:
-                import exllamav3_ext
-
-                if hasattr(exllamav3_ext, "exl3_moe"):
+                has_native = backend == "native" and native_moe_kernel_available()
+                has_exllamav3 = _exllamav3_moe_available()
+                if has_native or has_exllamav3:
                     build_exl3_fused_state(layer, inners)
                     fused_ok = True
                 else:
-                    fused_err = "exllamav3_ext.exl3_moe missing"
+                    fused_err = "no native or exllamav3 MoE kernel available"
             except Exception as exc:
                 fused_err = repr(exc)
                 layer._exl3_ptrs = None
