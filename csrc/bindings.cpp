@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "exl3_dequant.cuh"
+#include "p2b_batched.cuh"
 
 namespace {
 
@@ -135,11 +136,25 @@ at::Tensor exl3_gemv(const at::Tensor& x, const at::Tensor& trellis,
     return at::mm(x2.to(at::kFloat), w.to(at::kFloat)).to(x.scalar_type());
 }
 
+at::Tensor p2b_gemv_batched(const at::Tensor& x, const at::Tensor& trellis_ptrs,
+                            const at::Tensor& suh_ptrs, const at::Tensor& svh_ptrs,
+                            const at::Tensor& expert_indices, int64_t bits,
+                            bool mcg, int64_t mmode) {
+    TORCH_CHECK(x.is_cuda(), "batched GEMV requires CUDA tensors");
+    return p2b_gemv_batched_cuda(x, trellis_ptrs, suh_ptrs, svh_ptrs,
+                                 expert_indices, bits, mcg, mmode);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequant_trellis", &dequant_trellis,
           "Decode an EXL3 trellis tensor into an fp16 weight matrix");
     m.def("exl3_gemv", &exl3_gemv,
           "Native small-m EXL3 GEMV", py::arg("x"), py::arg("trellis"),
           py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("mcg"),
+          py::arg("mmode") = 1);
+    m.def("p2b_gemv_batched", &p2b_gemv_batched,
+          "Batched cooperative MoE EXL3 GEMV", py::arg("x"),
+          py::arg("trellis_ptrs"), py::arg("suh_ptrs"), py::arg("svh_ptrs"),
+          py::arg("expert_indices"), py::arg("K"), py::arg("mcg"),
           py::arg("mmode") = 1);
 }

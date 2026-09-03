@@ -25,7 +25,8 @@ setup(
         CUDAExtension(
             name="vllm_exl3_c",
             sources=[str(ROOT / "csrc" / "bindings.cpp"),
-                     str(ROOT / "csrc" / "exl3_gemv.cu")],
+                     str(ROOT / "csrc" / "exl3_gemv.cu"),
+                     str(ROOT / "csrc" / "p2b_batched.cu")],
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
