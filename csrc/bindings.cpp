@@ -8,6 +8,7 @@
 #include "p2b_batched.cuh"
 #include "p2b_moe.cuh"
 #include "exl3_gemm.cuh"
+#include "exl3_fat_gemm.cuh"
 
 namespace {
 
@@ -185,4 +186,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("down_trellis_ptrs"), py::arg("down_suh_ptrs"), py::arg("down_svh_ptrs"),
           py::arg("expert_indices"), py::arg("routing_weights"), py::arg("K_gate"),
           py::arg("K_up"), py::arg("K_down"), py::arg("mcg"));
+    m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
+          py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+          py::arg("K"), py::arg("mcg"), py::arg("mul1"));
+    m.def("exl3_fat_gemm_scatter", &exl3_fat_gemm_scatter, "Native EXL3 fat GEMM with token scatter",
+          py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+          py::arg("token_idx"), py::arg("route_weight"),
+          py::arg("K"), py::arg("mcg"), py::arg("mul1"));
 }

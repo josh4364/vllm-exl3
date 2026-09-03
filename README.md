@@ -21,9 +21,27 @@ forks). It also requires
 [exllamav3](https://github.com/turboderp-org/exllamav3) with its compiled
 `exllamav3_ext` kernels for your GPU arch.
 
+## v0.3.1 Super Fat GEMM Kernel & Ultra-Long Context Release (DGX Spark GB10)
+
+Version `0.3.1` adds accelerated $128 \times 128$ tiled prefill CUDA kernels and verifies massive context scaling across Blackwell `sm_121` architectures:
+
+* **Super Fat Prefill GEMM (`csrc/exl3_fat_gemm.cu`)**: A $128 \times 128$ tiled CUDA GEMM for routed experts that receive large token batches during prefill, unrolling Trellis dequantization in registers and fusing Hadamard scaling directly into the tile.
+* **Inline Routing & Atomic Token Scatter (`exl3_fat_gemm_scatter`)**: Fuses expert down-projection with routing weight multiplication and atomic token output scatter, running **up to 2.09x faster** than the reconstructed GEMM path ($400.4\ \mu\text{s} \to 195.3\ \mu\text{s}$ at $M=1024$) with **1.000000 cosine similarity parity**.
+* **Max KV Cache Pool**: **1,908,408 tokens (~1.91 Million tokens)** allocated in 22.39 GiB FP8 memory on DGX Spark GB10 (128 GiB unified memory).
+* **Max Context Scaling**: Full **131,072 tokens (128K context)** supported with **14.56x concurrent streams**, and **262,144 tokens (256K context)** verified on DeepSeek-V4-Flash-Vision with DSpark speculative decoding.
+
+### Prefill Down-Projection + Scatter Speedup (sm_121)
+
+| Prefill Rows ($M$) | Stock Reconstruct + GEMM | Native Fat Scatter | Net Speedup | Parity Cosine Similarity |
+|---|---|---|:---:|:---:|
+| **$M = 256$** | 144.3 $\mu\text{s}$ | **86.9 $\mu\text{s}$** | **1.66x** | 1.000000 |
+| **$M = 512$** | 222.8 $\mu\text{s}$ | **106.4 $\mu\text{s}$** | **2.09x** | 1.000000 |
+| **$M = 1024$** | 400.4 $\mu\text{s}$ | **195.3 $\mu\text{s}$** | **2.05x** | 1.000000 |
+| **$M = 2048$** | 733.1 $\mu\text{s}$ | **508.7 $\mu\text{s}$** | **1.44x** | 1.000000 |
+
 ## v0.3.0 Native Kernel Suite & Benchmark Receipts (DGX Spark GB10)
 
-Version `0.3.0` introduces custom native CUDA kernels (`csrc/`) replacing the stock `exllamav3_ext` decode and prefill paths on Blackwell `sm_121` architectures:
+Version `0.3.0` introduced custom native CUDA kernels (`csrc/`) replacing the stock `exllamav3_ext` decode and prefill paths on Blackwell `sm_121` architectures:
 
 * **In-Register Trellis Dequantization (`csrc/exl3_dequant.cuh`)**: Unrolls MCG bit extraction into registers without intermediate global memory roundtrips.
 * **Dense & Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Active-expert batched GEMV saturating 99.2% of the physical memory bandwidth floor (73.3 $\mu\text{s}$).

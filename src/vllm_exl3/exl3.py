@@ -464,6 +464,167 @@ def _apply_native_fused_moe(
     return native_out.to(dtype=torch.float32)
 
 
+_FAT_SCRATCH_CACHE: dict[tuple[str, int, int, int], dict[str, torch.Tensor]] = {}
+
+
+def _fat_scratch(
+    device: torch.device, capacity: int, gate: Any
+) -> dict[str, torch.Tensor]:
+    hidden = int(getattr(gate, "in_features", 4096))
+    intermediate = int(getattr(gate, "out_features", 2048))
+    key = (str(device), capacity, intermediate, hidden)
+    scratch = _FAT_SCRATCH_CACHE.get(key)
+    if scratch is not None:
+        return scratch
+
+    in_tiles, out_tiles, k_words = map(int, gate.trellis.shape)
+    scratch = {
+        "packed13": torch.empty(
+            (in_tiles, 2 * out_tiles, k_words),
+            dtype=torch.int16,
+            device=device,
+        ),
+        "svh13": torch.empty(
+            2 * intermediate, dtype=torch.float16, device=device
+        ),
+        "w13": torch.empty(
+            (hidden, 2 * intermediate), dtype=torch.float16, device=device
+        ),
+        "w2": torch.empty(
+            (intermediate, hidden), dtype=torch.float16, device=device
+        ),
+        "h": torch.empty(
+            (capacity, hidden), dtype=torch.float16, device=device
+        ),
+        "h13": torch.empty(
+            (capacity, hidden), dtype=torch.float16, device=device
+        ),
+        "gate_up": torch.empty(
+            (capacity, 2 * intermediate), dtype=torch.float32, device=device
+        ),
+        "act": torch.empty(
+            (capacity, intermediate), dtype=torch.float32, device=device
+        ),
+        "act_h": torch.empty(
+            (capacity, intermediate), dtype=torch.float16, device=device
+        ),
+        "h2": torch.empty(
+            (capacity, intermediate), dtype=torch.float16, device=device
+        ),
+        "down": torch.empty(
+            (capacity, hidden), dtype=torch.float32, device=device
+        ),
+    }
+    _FAT_SCRATCH_CACHE[key] = scratch
+    return scratch
+
+
+def _fat_kernel_available() -> bool:
+    native_c = _load_native_exl3_ext()
+    if native_c and hasattr(native_c, "exl3_fat_gemm"):
+        return True
+    try:
+        ext = load_exllamav3_ext()
+        return hasattr(ext, "exl3_fat_gemm")
+    except Exception:
+        return False
+
+
+def apply_exl3_batched_fat(
+    xh: torch.Tensor,
+    token_sorted: torch.Tensor,
+    weight_sorted: torch.Tensor,
+    counts_host: list[int],
+    inners: list[dict[str, Any]],
+    limit: float,
+    cap: int,
+    out: torch.Tensor,
+    use_kernel: bool = True,
+) -> torch.Tensor:
+    """Run fat experts with persistent scratch and accelerated 128x128 CUDA GEMM."""
+    native_c = _load_native_exl3_ext()
+    ext = (
+        native_c
+        if (native_c and hasattr(native_c, "exl3_fat_gemm"))
+        else load_exllamav3_ext()
+    )
+    offset = 0
+    for e, n_rows in enumerate(counts_host):
+        start = offset
+        offset += n_rows
+        if n_rows <= cap:
+            continue
+
+        token_idx = token_sorted[start:offset]
+        gate = inners[e]["gate"]
+        up = inners[e]["up"]
+        down = inners[e]["down"]
+        scratch = _fat_scratch(xh.device, n_rows, gate)
+        intermediate = int(gate.out_features)
+
+        h = scratch["h"][:n_rows]
+        h13 = scratch["h13"][:n_rows]
+        torch.index_select(xh, 0, token_idx, out=h)
+        ext.had_r_128(h, h13, gate.suh, None, 1.0)
+
+        packed13 = scratch["packed13"]
+        out_tiles = int(gate.trellis.shape[1])
+        packed13[:, :out_tiles].copy_(gate.trellis)
+        packed13[:, out_tiles:].copy_(up.trellis)
+        gate_up = scratch["gate_up"][:n_rows]
+        svh13 = scratch["svh13"]
+        svh13[:intermediate].copy_(gate.svh)
+        svh13[intermediate:].copy_(up.svh)
+
+        k = int(getattr(gate, "K", 4))
+        mcg = bool(getattr(gate, "mcg", True))
+        mul1 = bool(getattr(gate, "mul1", False))
+
+        if use_kernel and hasattr(ext, "exl3_fat_gemm"):
+            ext.exl3_fat_gemm(
+                h13, packed13, gate_up, svh13, k, mcg, mul1
+            )
+        else:
+            w13 = scratch["w13"]
+            ext.reconstruct(w13, packed13, k, mcg, mul1)
+            ext.hgemm(h13, w13, gate_up)
+            ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
+
+        gate_out = gate_up[:, :intermediate]
+        up_out = gate_up[:, intermediate:]
+        gate_out.clamp_(max=limit)
+        up_out.clamp_(min=-limit, max=limit)
+        act = scratch["act"][:n_rows]
+        torch.sigmoid(gate_out, out=act)
+        act.mul_(gate_out).mul_(up_out)
+        act_h = scratch["act_h"][:n_rows]
+        act_h.copy_(act)
+
+        h2 = scratch["h2"][:n_rows]
+        ext.had_r_128(act_h, h2, down.suh, None, 1.0)
+        if use_kernel and hasattr(ext, "exl3_fat_gemm_scatter"):
+            ext.exl3_fat_gemm_scatter(
+                h2,
+                down.trellis,
+                out,
+                down.svh,
+                token_idx,
+                weight_sorted[start:offset],
+                k,
+                mcg,
+                mul1,
+            )
+        else:
+            w2 = scratch["w2"]
+            ext.reconstruct(w2, down.trellis, k, mcg, mul1)
+            down_out = scratch["down"][:n_rows]
+            ext.hgemm(h2, w2, down_out)
+            ext.had_r_128(down_out, down_out, None, down.svh, 1.0)
+            down_out.mul_(weight_sorted[start:offset].unsqueeze(-1))
+            out.index_add_(0, token_idx, down_out)
+    return out
+
+
 def apply_exl3_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -588,16 +749,30 @@ def apply_exl3_fused_moe(
     if tokens > TEMP_ROWS_FUSED:
         fat = (counts > TEMP_ROWS_FUSED).nonzero(as_tuple=False).view(-1)
         if fat.numel():
-            apply_exl3_python_loop(
-                x2d,
-                ids,
-                weights,
-                inners,
-                expert_map,
-                limit,
-                only_experts=set(int(i) for i in fat.tolist()),
-                out=out,
-            )
+            if _fat_kernel_available():
+                counts_list = counts.tolist()
+                apply_exl3_batched_fat(
+                    xh,
+                    token_sorted,
+                    weight_sorted,
+                    counts_list,
+                    inners,
+                    limit,
+                    TEMP_ROWS_FUSED,
+                    out,
+                    use_kernel=True,
+                )
+            else:
+                apply_exl3_python_loop(
+                    x2d,
+                    ids,
+                    weights,
+                    inners,
+                    expert_map,
+                    limit,
+                    only_experts=set(int(i) for i in fat.tolist()),
+                    out=out,
+                )
     return out
 
 

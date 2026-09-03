@@ -18,6 +18,8 @@ else:
 include_dirs = [str(ROOT / "csrc")]
 if ext_include and ext_include.is_dir():
     include_dirs.append(str(ext_include))
+    if (ext_include / "quant").is_dir():
+        include_dirs.append(str(ext_include / "quant"))
 
 setup(
     name="vllm-exl3-native",
@@ -28,7 +30,8 @@ setup(
                      str(ROOT / "csrc" / "exl3_gemv.cu"),
                      str(ROOT / "csrc" / "p2b_batched.cu"),
                      str(ROOT / "csrc" / "p2b_moe.cu"),
-                     str(ROOT / "csrc" / "exl3_gemm.cu")],
+                     str(ROOT / "csrc" / "exl3_gemm.cu"),
+                     str(ROOT / "csrc" / "exl3_fat_gemm.cu")],
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
