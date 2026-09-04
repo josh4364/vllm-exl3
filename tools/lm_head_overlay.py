@@ -30,6 +30,47 @@ MARKERS = ("mul1", "mcg")
 FORK_KEY = "language_model.lm_head"
 
 
+def strip_tensor_from_shard(src_path, dst_path, drop_name, chunk=64 << 20):
+    """Copy a safetensors file without one tensor (re-based offsets, same order)."""
+    with open(src_path, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(hlen).decode("utf-8"))
+    if drop_name not in header:
+        D.log("  %s: %s not present, keeping symlink" % (os.path.basename(src_path), drop_name))
+        return
+    names = [n for n in header if n != "__metadata__" and n != drop_name]
+    names.sort(key=lambda n: header[n]["data_offsets"][0])
+    new_header, off = {}, 0
+    for n in names:
+        a, b = header[n]["data_offsets"]
+        new_header[n] = {"dtype": header[n]["dtype"], "shape": header[n]["shape"], "data_offsets": [off, off + (b - a)]}
+        off += b - a
+    if "__metadata__" in header:
+        new_header["__metadata__"] = header["__metadata__"]
+    hb = json.dumps(new_header, separators=(",", ":")).encode("utf-8")
+    hb += b" " * ((8 - len(hb) % 8) % 8)
+    if os.path.lexists(dst_path):
+        os.remove(dst_path)
+    tmp = dst_path + ".tmp"
+    D.log("  rewriting %s without %s (%.2f GB kept)" % (os.path.basename(src_path), drop_name, off / 1e9))
+    with open(src_path, "rb") as fin, open(tmp, "wb") as fout:
+        fout.write(struct.pack("<Q", len(hb)))
+        fout.write(hb)
+        for n in names:
+            a, b = header[n]["data_offsets"]
+            fin.seek(8 + hlen + a)
+            left = b - a
+            while left:
+                buf = fin.read(min(chunk, left))
+                if not buf:
+                    raise RuntimeError("short read in %s" % src_path)
+                fout.write(buf)
+                left -= len(buf)
+    os.replace(tmp, dst_path)
+    if os.path.getsize(dst_path) != 8 + len(hb) + off:
+        raise RuntimeError("stripped shard has unexpected size")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--branch", default="2.05bpw")
@@ -69,6 +110,13 @@ def main():
     overlay_name = "lm_head-exl3-%dbpw.safetensors" % k
     D.link_pack(args.src, args.out, overlay_name)
 
+    # vLLM's safetensors iterator yields every tensor in every indexed file, not
+    # just the index entries, so the BF16 head must physically leave its shard:
+    # write that one shard into the output pack without lm_head.weight.
+    bf16_shard = local_idx["weight_map"].get("lm_head.weight")
+    if bf16_shard:
+        strip_tensor_from_shard(os.path.join(args.src, bf16_shard), os.path.join(args.out, bf16_shard), "lm_head.weight")
+
     # one safetensors file: header + concatenated tensor bytes, 8-byte aligned header
     order = ["lm_head." + p for p in HEAD_PARTS] + ["lm_head." + marker]
     header, off = {}, 0
@@ -81,7 +129,11 @@ def main():
     hb = json.dumps(header, separators=(",", ":")).encode("utf-8")
     hb += b" " * ((8 - len(hb) % 8) % 8)
     out_path = os.path.join(args.out, overlay_name)
-    with open(out_path, "wb") as f:
+    expected = 8 + len(hb) + off
+    if os.path.exists(out_path) and os.path.getsize(out_path) == expected:
+        D.log("head file already present (%d bytes), skipping download" % expected)
+    else:
+      with open(out_path, "wb") as f:
         f.write(struct.pack("<Q", len(hb)))
         f.write(hb)
         for n in order:

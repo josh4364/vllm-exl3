@@ -18,14 +18,21 @@ namespace cg = cooperative_groups;
 template <int CFG> struct P2bCfg;
 // MINB = minimum resident blocks per SM requested through __launch_bounds__
 // (caps registers; measured occupancy was 50% at 78 regs for CFG 1).
-template <> struct P2bCfg<0> { static constexpr int WK = 16, WNT = 2, PF = 4,  FOLD = 4, MINB = 2; };
-template <> struct P2bCfg<1> { static constexpr int WK = 8,  WNT = 4, PF = 2,  FOLD = 2, MINB = 3; };
-template <> struct P2bCfg<2> { static constexpr int WK = 16, WNT = 4, PF = 16, FOLD = 4, MINB = 2; };
-template <> struct P2bCfg<3> { static constexpr int WK = 16, WNT = 2, PF = 16, FOLD = 4, MINB = 3; };
-template <> struct P2bCfg<4> { static constexpr int WK = 8,  WNT = 4, PF = 4,  FOLD = 4, MINB = 4; };
-template <> struct P2bCfg<5> { static constexpr int WK = 8,  WNT = 4, PF = 2,  FOLD = 2, MINB = 4; };
-template <> struct P2bCfg<6> { static constexpr int WK = 4,  WNT = 4, PF = 4,  FOLD = 4, MINB = 8; };
-constexpr int P2B_NUM_CFG = 7;
+// WI = warp-per-item: each warp streams one (pair, column group) over the whole
+// K range, so there is no cross-warp k-split, no shared-memory reduction and no
+// __syncthreads per item (ncu on GB10 showed `barrier` as the top stall of the
+// k-split design). WK is then simply the number of warps per block.
+template <> struct P2bCfg<0> { static constexpr int WK = 16, WNT = 2, PF = 4,  FOLD = 4, MINB = 2; static constexpr bool WI = false; };
+template <> struct P2bCfg<1> { static constexpr int WK = 8,  WNT = 4, PF = 2,  FOLD = 2, MINB = 3; static constexpr bool WI = false; };
+template <> struct P2bCfg<2> { static constexpr int WK = 16, WNT = 4, PF = 16, FOLD = 4, MINB = 2; static constexpr bool WI = false; };
+template <> struct P2bCfg<3> { static constexpr int WK = 16, WNT = 2, PF = 16, FOLD = 4, MINB = 3; static constexpr bool WI = false; };
+template <> struct P2bCfg<4> { static constexpr int WK = 8,  WNT = 4, PF = 4,  FOLD = 4, MINB = 4; static constexpr bool WI = false; };
+template <> struct P2bCfg<5> { static constexpr int WK = 8,  WNT = 4, PF = 2,  FOLD = 2, MINB = 4; static constexpr bool WI = false; };
+template <> struct P2bCfg<6> { static constexpr int WK = 4,  WNT = 4, PF = 4,  FOLD = 4, MINB = 8; static constexpr bool WI = false; };
+template <> struct P2bCfg<7> { static constexpr int WK = 8,  WNT = 4, PF = 8,  FOLD = 4, MINB = 3; static constexpr bool WI = true; };
+template <> struct P2bCfg<8> { static constexpr int WK = 8,  WNT = 2, PF = 8,  FOLD = 4, MINB = 3; static constexpr bool WI = true; };
+template <> struct P2bCfg<9> { static constexpr int WK = 8,  WNT = 4, PF = 4,  FOLD = 4, MINB = 3; static constexpr bool WI = true; };
+constexpr int P2B_NUM_CFG = 10;
 constexpr int P2B_MAX_COLS = 64;
 constexpr int P2B_MAX_PAIRS = 64;
 
@@ -183,6 +190,145 @@ __device__ __forceinline__ void run_gemv_tile(
     __syncthreads();
 }
 
+// Warp-per-item variant of run_gemv_tile: one warp streams the whole K range of
+// one (pair, column group); no shared memory, no block barrier.
+template <int bits, int cb, int CFG>
+__device__ __forceinline__ void run_gemv_warp(
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2,
+    half* __restrict__ C,
+    int kslices,
+    int group,
+    int ntiles,
+    int lane)
+{
+    constexpr int WNT = P2bCfg<CFG>::WNT;
+    constexpr int PF = P2bCfg<CFG>::PF;
+    constexpr int FOLD = P2bCfg<CFG>::FOLD;
+    constexpr int COLS = WNT * 16;
+    static_assert(PF % FOLD == 0, "FOLD must divide PF");
+    constexpr int TWORDS = 8 * bits;
+    constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;
+    constexpr int LSTRIDE = bits == 3 ? 24 : 32;
+
+    const int ks0 = 0;
+    const int myn = kslices;
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+
+    const size_t a_row0 = 0;
+    const bool r0_ok = lane < 4;
+    const half2 hzero = __half2half2(__ushort_as_half(0));
+
+    int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+    if constexpr (bits == 2) {
+        int i1 = lane >> 1;
+        x_src_b = i1;
+        x_src_a = (i1 + 15) & 15;
+    } else if constexpr (bits == 3) {
+        int t_offset = lane << 3;
+        int b1 = (t_offset + 257) * 3;
+        int b2 = b1 + 21;
+        int i0 = (b1 - 16) / 32;
+        int i2 = (b2 - 1) / 32;
+        x_s2 = (i2 + 1) * 32 - b2;
+        x_src_a = i0 % 24;
+        x_src_b = i2 % 24;
+    }
+
+    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+
+    auto ld_b = [&] (int i, int l) -> uint32_t {
+        if constexpr (bits == 3)
+            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+        else
+            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+    };
+
+    uint32_t pf[PF][LOADS];
+    #pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < myn)
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                pf[d][l] = ld_b(d, l);
+
+    FragC_h ch[WNT][2] = {};
+    float2 acc0[WNT][2] = {};
+
+    for (int ib = 0; ib < myn; ib += PF) {
+        #pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int i = ib + d;
+            if (i >= myn) break;
+
+            uint32_t bw[LOADS];
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                bw[l] = pf[d][l];
+
+            if (i + PF < myn) {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_b(i + PF, l);
+            }
+
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            FragB a01, a23;
+            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[1] = hzero;
+            a23[1] = hzero;
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t) {
+                FragB f0, f1;
+                if constexpr (bits == 4) {
+                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+                } else if constexpr (bits == 2) {
+                    const uint32_t w = bw[t >> 1];
+                    const int base = (t & 1) << 4;
+                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                } else {
+                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                }
+
+                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+            }
+
+            if ((d + 1) % FOLD == 0 || i + 1 == myn) {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f) {
+                        acc0[t][f].x += __low2float(ch[t][f][0]);
+                        acc0[t][f].y += __high2float(ch[t][f][0]);
+                        ch[t][f][0] = hzero;
+                    }
+            }
+        }
+    }
+
+    // Lanes 0..3 hold row 0: cols t*16 + f*8 + 2*(lane&3) (+1). No cross-warp
+    // reduction: this warp covered the whole K range.
+    if (lane < 4) {
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t) {
+            #pragma unroll
+            for (int f = 0; f < 2; ++f) {
+                const int col = group * COLS + t * 16 + f * 8 + (lane & 3) * 2;
+                C[col + 0] = __float2half_rn(acc0[t][f].x);
+                C[col + 1] = __float2half_rn(acc0[t][f].y);
+            }
+        }
+    }
+}
+
 template <int BITS, int CFG>
 __global__ __launch_bounds__(P2bCfg<CFG>::WK * 32, P2bCfg<CFG>::MINB)
 void p2b_moe_batched_kernel(
@@ -286,6 +432,20 @@ void p2b_moe_batched_kernel(
     // Phase 2: Batched Gate & Up GEMV across all active experts
     {
         int total_work = 2 * experts * num_groups_gate;
+        if constexpr (P2bCfg<CFG>::WI) {
+            const int gwarp = blockIdx.x * (blockDim.x / 32) + warp;
+            const int gwarps = gridDim.x * (blockDim.x / 32);
+            for (int item = gwarp; item < total_work; item += gwarps) {
+                int is_up = item & 1;
+                int rem = item >> 1;
+                int e = rem / num_groups_gate;
+                int group = rem % num_groups_gate;
+                const uint32_t* B32 = is_up ? s_ut[e] : s_gt[e];
+                const half2* A2 = reinterpret_cast<const half2*>((is_up ? had_up : had_gate) + e * hidden);
+                half* C = (is_up ? up : gate) + e * inter;
+                run_gemv_warp<BITS, 1, CFG>(B32, A2, C, kslices_gate, group, ntiles_gate, lane);
+            }
+        } else
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int is_up = item & 1;
             int rem = item >> 1;
@@ -354,6 +514,18 @@ void p2b_moe_batched_kernel(
     // Phase 4: Batched Down GEMV across all active experts
     {
         int total_work = experts * num_groups_down;
+        if constexpr (P2bCfg<CFG>::WI) {
+            const int gwarp = blockIdx.x * (blockDim.x / 32) + warp;
+            const int gwarps = gridDim.x * (blockDim.x / 32);
+            for (int item = gwarp; item < total_work; item += gwarps) {
+                int e = item / num_groups_down;
+                int group = item % num_groups_down;
+                const uint32_t* B32 = s_dt[e];
+                const half2* A2 = reinterpret_cast<const half2*>(had_down + e * inter);
+                half* C = down + e * hidden;
+                run_gemv_warp<BITS, 1, CFG>(B32, A2, C, kslices_down, group, ntiles_down, lane);
+            }
+        } else
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int e = item / num_groups_down;
             int group = item % num_groups_down;
@@ -502,6 +674,9 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
             case 4: launch_moe_batched<K_, 4>(P2B_ARGS); break; \
             case 5: launch_moe_batched<K_, 5>(P2B_ARGS); break; \
             case 6: launch_moe_batched<K_, 6>(P2B_ARGS); break; \
+            case 7: launch_moe_batched<K_, 7>(P2B_ARGS); break; \
+            case 8: launch_moe_batched<K_, 8>(P2B_ARGS); break; \
+            case 9: launch_moe_batched<K_, 9>(P2B_ARGS); break; \
             default: launch_moe_batched<K_, 1>(P2B_ARGS); break; \
         }
     if (kg == 2) { P2B_DISPATCH_K(2) }
