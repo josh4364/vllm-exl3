@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Native MoE dispatch fix (correctness)**: `_apply_native_fused_moe` indexed the flat
+  `(tokens*topk,)` tensor returned by `map_topk_to_local` as if it were `(tokens, topk)`,
+  so each token was computed with a single routed expert and rows >= 1 received the wrong
+  token's routing. Symptoms in serving: output collapses into repetition within a few tokens,
+  MTP acceptance 0-15%. The 0.3.x "native" speed figures were produced with 1/8 of the expert
+  work. The kernel itself was correct; the parity test could not see the bug because it
+  compares `p2b_fused_moe` against `exl3_gemv` (the same kernel body) at m=1.
+- **Multi-row fused launch (`csrc/p2b_moe.cu`)**: one cooperative launch per layer covers the
+  whole decode batch (`ids`/`weights` flattened as `(rows, topk)`, pair `e` maps to row
+  `e / topk`); pointer tables resolved once per block into shared memory; tile configuration
+  table (`VLLM_EXL3_P2B_CFG`, default CFG 1). On a DGX Spark GB10 with GLM-5.3-Flash K2: 1.65 ms
+  for a 3-row / 24-expert step vs 2.80 ms for ExLlamaV3 `exl3_moe`; end-to-end decode
+  8.9 -> 14.1 tok/s on the recipe's 128-token harness with MTP k=2.
+- **`Exl3LMHeadMethod`**: EXL3 `ParallelLMHead`, declared under
+  `non_routed_exl3.layers["<prefix>.lm_head"]`; `tools/lm_head_overlay.py` fetches the Hub
+  pack's quantized head. 5-bit head: 2.7 ms vs 9.5 ms BF16 per projection on GB10, identical
+  top-1 tokens on random probes.
+- **Tests**: `test_p2b_moe_multirow_matches_independent_reference` checks rows 1/3/8 against
+  ExLlamaV3 `LinearEXL3`; the latency assertion is configurable (`P2B_LATENCY_TARGET_US`).
+
 ## 0.3.1
 
 - **Super Fat GEMM Prefill Kernel Suite (`csrc/exl3_fat_gemm.cu`, `csrc/exl3_fat_gemm.cuh`)**:
