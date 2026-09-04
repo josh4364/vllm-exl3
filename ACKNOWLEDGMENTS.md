@@ -5,7 +5,9 @@
 - **[vLLM](https://github.com/vllm-project/vllm)** — the serving engine and
   the plugin/quantization interfaces this package registers into.
 - **[MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks)**
-  (MIT-licensed) — idea and benchmark credits; no code was copied:
+  (MIT-licensed) — idea and benchmark credits, routed-expert serving path, and
+  Fat GEMM CUDA kernels (`csrc/exl3_fat_gemm.cu` and `csrc/exl3_fat_gemm.cuh`
+  copied and adapted with include paths updated; see `THIRD_PARTY_NOTICES.md`):
   - fat-expert prefill batching approach and measurements
     ([PR #77](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/77)
     by @plotarmordev);

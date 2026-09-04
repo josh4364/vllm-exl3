@@ -22,3 +22,8 @@ vllm_exl3 = "vllm_exl3:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

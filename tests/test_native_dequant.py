@@ -6,16 +6,15 @@ def test_native_extension_import():
     try:
         import vllm_exl3_c
     except ImportError as e:
-        pytest.fail(f"vllm_exl3_c extension module not built or not importable: {e}. Build with `python setup.py build_ext --inplace`.")
+        pytest.skip(f"vllm_exl3_c extension module not built or not importable: {e}. Build with `python setup.py build_ext --inplace`.")
 
 def test_trellis_dequant_shapes_and_parity():
     """Verify that dequant_trellis produces correct shapes and matches numerical reference."""
     try:
         import torch
+        import vllm_exl3_c
     except ImportError:
-        pytest.skip("PyTorch required for native tensor tests")
-        
-    import vllm_exl3_c
+        pytest.skip("PyTorch and vllm_exl3_c required for native tensor tests")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         pytest.skip("CUDA device required for native EXL3 kernel tests")

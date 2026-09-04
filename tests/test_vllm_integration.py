@@ -1,6 +1,5 @@
 """Unit test verifying vLLM production integration and native kernel dispatch."""
 import pytest
-import torch
 
 def test_vllm_exl3_module_imports():
     """Verify that src.vllm_exl3.exl3 imports and exposes native kernel configuration."""

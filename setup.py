@@ -2,42 +2,68 @@ from pathlib import Path
 import os
 
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
 
 ROOT = Path(__file__).resolve().parent
-ext_include = os.environ.get("EXL3_EXT_INCLUDE")
-if ext_include:
-    ext_include = Path(ext_include)
-else:
+
+ext_modules = []
+cmdclass = {}
+
+if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
     try:
-        import exllamav3
-        ext_include = Path(exllamav3.__file__).resolve().parent / "exllamav3_ext"
-    except Exception:
-        ext_include = None
-include_dirs = [str(ROOT / "csrc")]
-if ext_include and ext_include.is_dir():
-    include_dirs.append(str(ext_include))
-    if (ext_include / "quant").is_dir():
-        include_dirs.append(str(ext_include / "quant"))
+        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+        ext_include = os.environ.get("EXL3_EXT_INCLUDE")
+        if ext_include:
+            ext_include = Path(ext_include)
+        else:
+            try:
+                import exllamav3
+                ext_include = Path(exllamav3.__file__).resolve().parent / "exllamav3_ext"
+            except Exception:
+                ext_include = None
+
+        if not (ext_include and ext_include.is_dir()):
+            candidates = [
+                Path("/tmp/exllamav3/exllamav3/exllamav3_ext"),
+                Path("/tmp/exllamav3_build/exllamav3/exllamav3_ext"),
+                Path.home() / "src/glm53-exl3-runtime/exllamav3/exllamav3/exllamav3_ext",
+                Path.home() / "exllamav3/exllamav3/exllamav3_ext",
+            ]
+            for c in candidates:
+                if c.is_dir():
+                    ext_include = c
+                    break
+
+        include_dirs = [str(ROOT / "csrc")]
+        if ext_include and ext_include.is_dir():
+            include_dirs.append(str(ext_include))
+            if (ext_include / "quant").is_dir():
+                include_dirs.append(str(ext_include / "quant"))
+
+        ext_modules.append(
+            CUDAExtension(
+                name="vllm_exl3_c",
+                sources=[
+                    str(ROOT / "csrc" / "bindings.cpp"),
+                    str(ROOT / "csrc" / "exl3_gemv.cu"),
+                    str(ROOT / "csrc" / "p2b_batched.cu"),
+                    str(ROOT / "csrc" / "p2b_moe.cu"),
+                    str(ROOT / "csrc" / "exl3_gemm.cu"),
+                    str(ROOT / "csrc" / "exl3_fat_gemm.cu"),
+                ],
+                include_dirs=include_dirs,
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"],
+                    "nvcc": ["-O3", "-std=c++17"],
+                },
+            )
+        )
+        cmdclass["build_ext"] = BuildExtension
+    except ImportError:
+        pass
 
 setup(
-    name="vllm-exl3-native",
-    ext_modules=[
-        CUDAExtension(
-            name="vllm_exl3_c",
-            sources=[str(ROOT / "csrc" / "bindings.cpp"),
-                     str(ROOT / "csrc" / "exl3_gemv.cu"),
-                     str(ROOT / "csrc" / "p2b_batched.cu"),
-                     str(ROOT / "csrc" / "p2b_moe.cu"),
-                     str(ROOT / "csrc" / "exl3_gemm.cu"),
-                     str(ROOT / "csrc" / "exl3_fat_gemm.cu")],
-            include_dirs=include_dirs,
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17"],
-            },
-        )
-    ],
-    cmdclass={"build_ext": BuildExtension},
+    name="vllm-exl3",
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )

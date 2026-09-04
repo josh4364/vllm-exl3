@@ -56,7 +56,7 @@ SOFTWARE.
 
 Author: [@turboderp](https://github.com/turboderp).
 
-https://github.com/turboderp/exllamav3
+https://github.com/turboderp-org/exllamav3
 
 The CUDA sources in `csrc/` build against ExLlamaV3's extension headers, including
 `quant/exl3_gemv_kernel.cuh`, `exl3_dq.cuh`, `hadamard_inner.cuh`, `util.h`, `util.cuh` and

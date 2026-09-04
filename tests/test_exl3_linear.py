@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import sys
 
-import torch
-
 try:
     import pytest
+    torch = pytest.importorskip("torch")
 except ImportError:  # the serving venv has no pytest; run as a script instead
 
     class _Skip(Exception):
