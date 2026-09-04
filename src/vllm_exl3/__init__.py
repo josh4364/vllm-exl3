@@ -6,6 +6,8 @@ __all__ = [
     "parse_speculative_schedule",
     "is_adaptive_verification_enabled",
     "filter_speculative_candidates",
+    "compute_mla_kv_cache_bytes",
+    "validate_context_scaling",
 ]
 
 
@@ -26,6 +28,8 @@ def __getattr__(name: str):
         "parse_speculative_schedule",
         "is_adaptive_verification_enabled",
         "filter_speculative_candidates",
+        "compute_mla_kv_cache_bytes",
+        "validate_context_scaling",
     }:
         from . import exl3
 

@@ -24,6 +24,7 @@ work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +78,146 @@ DEFAULT_SPECULATIVE_SCHEDULE: list[tuple[int, int, int]] = [
 ]
 SPECULATIVE_SCHEDULE_ENV = "VLLM_EXL3_SPEC_SCHEDULE"
 ADAPTIVE_VERIFICATION_ENV = "VLLM_EXL3_ADAPTIVE_VERIFICATION"
+
+
+def compute_mla_kv_cache_bytes(
+    context_len: int,
+    num_layers: int = 43,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    dtype_bytes: int = 1,
+) -> int:
+    """Return the FP8 MLA KV-cache footprint for ``context_len`` tokens.
+
+    DeepSeek-V4 stores one compressed KV latent and one decoupled RoPE key per
+    layer.  The calculation is intentionally integer-only so callers can use
+    it for an exact allocation or admission decision before starting a boot.
+    """
+    values = {
+        "context_len": context_len,
+        "num_layers": num_layers,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "dtype_bytes": dtype_bytes,
+    }
+    normalized: dict[str, int] = {}
+    for name, value in values.items():
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+        try:
+            integer = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError(f"{name} must be an integer") from exc
+        if integer != value:
+            raise ValueError(f"{name} must be an integer")
+        if integer < 0:
+            raise ValueError(f"{name} must be non-negative")
+        normalized[name] = integer
+
+    return (
+        normalized["context_len"]
+        * normalized["num_layers"]
+        * (normalized["kv_lora_rank"] + normalized["qk_rope_head_dim"])
+        * normalized["dtype_bytes"]
+    )
+
+
+def _env_float_override(default: float, *names: str, minimum: float | None = None) -> float:
+    """Read the first valid finite float from a list of environment names."""
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw.strip())
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or (minimum is not None and value < minimum):
+            continue
+        return value
+    return default
+
+
+def _env_int_override(default: int, *names: str, minimum: int | None = None) -> int:
+    """Read the first valid integer from a list of environment names."""
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw.strip(), 10)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if minimum is not None and value < minimum:
+            continue
+        return value
+    return default
+
+
+def validate_context_scaling(
+    max_model_len: int,
+    model_weights_gb: float = 95.4,
+    total_mem_gb: float = 128.0,
+    mem_util: float = 0.90,
+    chunk_size: int = 2048,
+) -> dict[str, float | int | bool]:
+    """Validate an MLA context ceiling against a unified-memory budget.
+
+    ``VLLM_EXL3_CONTEXT_*`` variables are the canonical overrides.  Shorter
+    ``VLLM_EXL3_*`` aliases are accepted for shell compatibility.  Invalid
+    values are ignored and leave the corresponding function argument intact.
+    ``chunk_size`` is reported so callers can associate the result with their
+    chunked-prefill configuration; it does not alter the static KV footprint.
+    """
+    if isinstance(max_model_len, bool):
+        raise ValueError("max_model_len must be positive")
+    try:
+        max_model_len = int(max_model_len)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_model_len must be positive") from exc
+    if max_model_len <= 0:
+        raise ValueError("max_model_len must be positive")
+
+    model_weights_gb = _env_float_override(
+        float(model_weights_gb),
+        "VLLM_EXL3_CONTEXT_MODEL_WEIGHTS_GB",
+        "VLLM_EXL3_MODEL_WEIGHTS_GB",
+        minimum=0.0,
+    )
+    total_mem_gb = _env_float_override(
+        float(total_mem_gb),
+        "VLLM_EXL3_CONTEXT_TOTAL_MEM_GB",
+        "VLLM_EXL3_TOTAL_MEM_GB",
+        minimum=0.0,
+    )
+    mem_util = _env_float_override(
+        float(mem_util),
+        "VLLM_EXL3_CONTEXT_MEM_UTIL",
+        "VLLM_EXL3_MEM_UTIL",
+        minimum=0.0,
+    )
+    chunk_size = _env_int_override(
+        int(chunk_size),
+        "VLLM_EXL3_CONTEXT_CHUNK_SIZE",
+        "VLLM_EXL3_CHUNK_SIZE",
+        minimum=1,
+    )
+
+    kv_cache_bytes = compute_mla_kv_cache_bytes(max_model_len)
+    kv_cache_gb = kv_cache_bytes / (1024**3)
+    usable_mem_gb = total_mem_gb * mem_util
+    available_headroom_gb = usable_mem_gb - model_weights_gb - kv_cache_gb
+    safety_margin_gb = total_mem_gb - model_weights_gb - kv_cache_gb
+    return {
+        "max_model_len": max_model_len,
+        "kv_cache_bytes": kv_cache_bytes,
+        "kv_cache_gb": kv_cache_gb,
+        "usable_mem_gb": usable_mem_gb,
+        "available_headroom_gb": available_headroom_gb,
+        "fits": available_headroom_gb > 0.0,
+        "safety_margin_gb": safety_margin_gb,
+        "chunk_size": chunk_size,
+    }
 
 
 def _validated_speculative_schedule(schedule: object) -> list[tuple[int, int, int]] | None:
