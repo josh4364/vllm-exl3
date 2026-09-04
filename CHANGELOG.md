@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1
+
+- **Super Fat GEMM Prefill Kernel Suite (`csrc/exl3_fat_gemm.cu`, `csrc/exl3_fat_gemm.cuh`)**:
+  - Tiled chunked prefill kernel optimized for wide-layer routed expert evaluation during high-context and large-batch prompts.
+  - Implements batched matrix multiplication over unquantized and trellis-dequantized states with register-level unrolling.
+  - Dispatched automatically via `apply_exl3_batched_fat` in `src/vllm_exl3/exl3.py`.
+- **Bug Fix**:
+  - Guard `k == 4` in `apply_exl3_batched_fat` dispatch to prevent illegal memory layout indexing when handling 4-bit trellis tiles.
+- **Upstream Attribution & Notice Compliance**:
+  - Full third-party attribution prominently placed at the top of `README.md` and detailed in `THIRD_PARTY_NOTICES.md`.
+  - Credits to @MiaAI-Lab and @plotarmordev for the routed-expert EXL3 serving path and Fat GEMM CUDA kernels (`GLM-5.3-Flash-EXL3-2x-DGX-Sparks`, commit `4b8d3c7`).
+  - Credits to @turboderp for the ExLlamaV3 trellis quantization format, MCG codebook, and base dequantization math.
+- **Hardware Benchmarks**:
+  - Benchmarked on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory.
+
 ## 0.3.0
 
 - **Native EXL3 CUDA Kernel Suite (`csrc/`)**: High-performance native CUDA kernels replacing `exllamav3_ext` decode and prefill paths on NVIDIA Blackwell `sm_121` / Hopper `sm_90`:
