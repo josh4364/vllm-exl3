@@ -1,6 +1,12 @@
 """Register the routed-expert EXL3 implementation with a local vLLM runtime."""
 
-__all__ = ["register", "get_speculative_draft_tokens", "parse_speculative_schedule"]
+__all__ = [
+    "register",
+    "get_speculative_draft_tokens",
+    "parse_speculative_schedule",
+    "is_adaptive_verification_enabled",
+    "filter_speculative_candidates",
+]
 
 
 def register() -> None:
@@ -15,7 +21,12 @@ def __getattr__(name: str):
     implementation import lazy preserves the existing lightweight entry-point
     behaviour while still supporting ``from vllm_exl3 import ...``.
     """
-    if name in {"get_speculative_draft_tokens", "parse_speculative_schedule"}:
+    if name in {
+        "get_speculative_draft_tokens",
+        "parse_speculative_schedule",
+        "is_adaptive_verification_enabled",
+        "filter_speculative_candidates",
+    }:
         from . import exl3
 
         return getattr(exl3, name)

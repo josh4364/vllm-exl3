@@ -76,6 +76,7 @@ DEFAULT_SPECULATIVE_SCHEDULE: list[tuple[int, int, int]] = [
     (9, 16, 1),
 ]
 SPECULATIVE_SCHEDULE_ENV = "VLLM_EXL3_SPEC_SCHEDULE"
+ADAPTIVE_VERIFICATION_ENV = "VLLM_EXL3_ADAPTIVE_VERIFICATION"
 
 
 def _validated_speculative_schedule(schedule: object) -> list[tuple[int, int, int]] | None:
@@ -176,6 +177,53 @@ def get_speculative_draft_tokens(
         if min_bs <= batch_size <= max_bs:
             return draft_tokens
     return 0
+
+
+def is_adaptive_verification_enabled() -> bool:
+    """Return whether confidence-based speculative verification is enabled.
+
+    Only explicit affirmative values enable the feature.  This fail-closed
+    policy keeps an unset, misspelled, or otherwise unknown environment value
+    from changing verification behaviour unexpectedly in a serving process.
+    """
+    value = os.environ.get(ADAPTIVE_VERIFICATION_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def filter_speculative_candidates(
+    probs: torch.Tensor,
+    threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor | int]:
+    """Keep the confident prefix of each speculative candidate sequence.
+
+    Candidate verification is sequential: once a candidate falls below
+    ``threshold``, that candidate and every later candidate in the same
+    sequence are pruned.  A one-dimensional input is treated as one sequence
+    and returns a Python ``int`` count; batched inputs return one ``long``
+    count per leading sequence.
+    """
+    if not isinstance(probs, torch.Tensor):
+        raise TypeError(f"probs must be a torch.Tensor, got {type(probs).__name__}")
+
+    if probs.ndim == 0:
+        raise ValueError("probs must have a candidate dimension (at least 1D)")
+
+    num_candidates = probs.shape[-1]
+    if num_candidates == 0:
+        mask = torch.zeros_like(probs, dtype=torch.bool)
+        if probs.ndim == 1:
+            return mask, 0
+        return mask, torch.zeros(probs.shape[:-1], dtype=torch.long, device=probs.device)
+
+    confident = torch.ge(probs, threshold)
+    # cumprod encodes the first-failure cutoff without Python loops or host
+    # synchronization, so the operation remains on the candidate tensor's
+    # device during decode.
+    mask = torch.cumprod(confident.to(dtype=torch.int64), dim=-1).to(dtype=torch.bool)
+    kept_counts = mask.sum(dim=-1, dtype=torch.long)
+    if probs.ndim == 1:
+        return mask, int(kept_counts.item())
+    return mask, kept_counts
 
 
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
