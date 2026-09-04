@@ -412,6 +412,28 @@ def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> to
     return tensor.narrow(dim, chunk * tp_rank, chunk).contiguous()
 
 
+def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+    """Resolve per-layer TP metadata before consulting process-wide TP state."""
+    for owner in owners:
+        if owner is None:
+            continue
+        rank = getattr(owner, "tp_rank", None)
+        size = getattr(owner, "moe_tp_size", None)
+        if size is None:
+            size = getattr(owner, "tp_size", None)
+        if size is None:
+            size = getattr(owner, "_exl3_tp_size", None)
+        if rank is not None or size is not None:
+            return int(rank) if rank is not None else 0, int(size) if size is not None else 1
+
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+
+
 def shard_exl3_col(loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int) -> torch.Tensor:
     """Gate/up: trellis dim 1 and svh dim 0 are column-parallel."""
     if suffix == "trellis":
@@ -566,9 +588,19 @@ def pin_exl3_expert_map(
     emap = getattr(layer, "expert_map", None)
     if emap is None:
         return None
-    if emap.device != device or emap.dtype != torch.long:
-        layer.expert_map = emap.to(device=device, dtype=torch.long)
-    return layer.expert_map
+    raw_id = id(emap)
+    cached = getattr(layer, "_exl3_pinned_expert_map", None)
+    if (
+        getattr(layer, "_exl3_raw_expert_map_id", None) == raw_id
+        and cached is not None
+        and cached.device == device
+        and cached.dtype == torch.long
+    ):
+        return cached
+    pinned = emap.to(device=device, dtype=torch.long)
+    layer._exl3_pinned_expert_map = pinned
+    layer._exl3_raw_expert_map_id = raw_id
+    return pinned
 
 
 def map_topk_to_local(
@@ -1583,11 +1615,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         expert_id: int = 0,
         return_success: bool = False,
     ) -> bool | None:
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-
         layer = param
         # param is the Parameter; expert_id is already physical. Map to local
         # via the owning module if present on the weight_loader closure... we
@@ -1600,8 +1627,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 return False if return_success else None
             expert_id = local_id
 
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank, tp_size = _resolve_tp_geometry(owner, layer)
         suffix = _suffix_from_mapped_name(weight_name)
         loaded = loaded_weight.detach().contiguous()
 
@@ -1801,7 +1827,7 @@ class Exl3LinearMethod(LinearMethodBase):
         # Get bf16_shards from config (may be empty)
         bf16_shards = self.quant_config._bf16_shards_for(getattr(layer, "prefix", ""))
         if bf16_shards:
-            tp_size = get_tensor_model_parallel_world_size()
+            _, tp_size = _resolve_tp_geometry(layer)
             if tp_size > 1:
                 raise RuntimeError(
                     f"EXL3 bf16 shards are not supported with TP size > 1; tp_size={tp_size}"
@@ -1880,10 +1906,22 @@ class Exl3LinearMethod(LinearMethodBase):
             ("mul1", mul1_param),
         ):
             p.weight_loader = self._make_weight_loader(
-                suffix, n_shards, output_partition_sizes, is_row_parallel, bf16_shards
+                suffix,
+                n_shards,
+                output_partition_sizes,
+                is_row_parallel,
+                bf16_shards,
+                layer,
+                is_qkv_parallel,
             )
         weight_param.weight_loader = self._make_weight_loader(
-            "weight", n_shards, output_partition_sizes, is_row_parallel, bf16_shards
+            "weight",
+            n_shards,
+            output_partition_sizes,
+            is_row_parallel,
+            bf16_shards,
+            layer,
+            is_qkv_parallel,
         )
 
         # Store metadata
@@ -1895,7 +1933,16 @@ class Exl3LinearMethod(LinearMethodBase):
         layer._exl3_linear_is_merged = is_merged_col_parallel
         layer._exl3_linear_bf16_shards = bf16_shards
 
-    def _make_weight_loader(self, suffix, n_shards, output_partition_sizes, is_row_parallel, bf16_shards):
+    def _make_weight_loader(
+        self,
+        suffix,
+        n_shards,
+        output_partition_sizes,
+        is_row_parallel,
+        bf16_shards,
+        layer=None,
+        is_qkv_parallel=False,
+    ):
         """Create a weight_loader closure for EXL3 linear parameters."""
 
         def weight_loader(
@@ -1903,13 +1950,7 @@ class Exl3LinearMethod(LinearMethodBase):
             loaded_weight: torch.Tensor,
             loaded_shard_id: str | int | None = None,
         ) -> None:
-            from vllm.distributed import (
-                get_tensor_model_parallel_rank,
-                get_tensor_model_parallel_world_size,
-            )
-
-            tp_rank = get_tensor_model_parallel_rank()
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank, tp_size = _resolve_tp_geometry(layer, param)
 
             # Map shard_id to shard index
             shard_idx = 0
@@ -1936,22 +1977,39 @@ class Exl3LinearMethod(LinearMethodBase):
                     # Check shape matches the expected shard size
                     expected_out = output_partition_sizes[shard_idx]
                     expected_in = param.shape[1]
-                    loaded_shape = loaded_weight.shape
-                    if loaded_shape[0] != expected_out or (len(loaded_shape) > 1 and loaded_shape[1] != expected_in):
-                        # After TP narrowing, expect (shard_out, in)
-                        tp_sharded = _narrow_tp(loaded_weight, 0, tp_rank, tp_size) if is_row_parallel else _narrow_tp(loaded_weight, 1, tp_rank, tp_size) if not is_row_parallel else loaded_weight
-                        if tuple(tp_sharded.shape) != (expected_out, expected_in):
-                            raise RuntimeError(
-                                f"EXL3 weight load shape mismatch shard={shard_idx}: "
-                                f"expected ({expected_out},{expected_in}) but got {tuple(loaded_weight.shape)} "
-                                f"(after TP: {tuple(tp_sharded.shape)})"
-                            )
+                    loaded = loaded_weight.detach().contiguous()
+                    loaded_shape = loaded.shape
+                    if is_qkv_parallel and not is_row_parallel:
+                        total_out = int(loaded_shape[0])
+                        shard_tp_size = max(1, total_out // expected_out)
+                        shard_tp_rank = tp_rank // max(1, tp_size // shard_tp_size)
+                    else:
+                        shard_tp_size = tp_size
+                        shard_tp_rank = tp_rank
+                    if tuple(loaded_shape) == (expected_out, expected_in):
+                        tp_sharded = loaded
+                    else:
+                        # Row-parallel input is sharded on dim 1; column-parallel
+                        # output is sharded on dim 0.
+                        slice_dim = 1 if is_row_parallel else 0
+                        tp_sharded = _narrow_tp(
+                            loaded,
+                            slice_dim,
+                            shard_tp_rank,
+                            shard_tp_size,
+                        )
+                    if tuple(tp_sharded.shape) != (expected_out, expected_in):
+                        raise RuntimeError(
+                            f"EXL3 weight load shape mismatch shard={shard_idx}: "
+                            f"expected ({expected_out},{expected_in}) but got {tuple(loaded.shape)} "
+                            f"(after TP: {tuple(tp_sharded.shape)})"
+                        )
                     # If this shard is in bf16_shards, copy; otherwise discard
                     if shard_idx in bf16_shards:
                         bf16_idx = bf16_shards.index(shard_idx)
                         bf16_row_start = sum(output_partition_sizes[i] for i in bf16_shards[:bf16_idx])
                         bf16_row_end = bf16_row_start + expected_out
-                        param.data[bf16_row_start:bf16_row_end].copy_(loaded_weight.detach())
+                        param.data[bf16_row_start:bf16_row_end].copy_(tp_sharded)
                     # else: discard this EXL3 shard's stale BF16 weight
                     return
                 else:
@@ -1968,13 +2026,28 @@ class Exl3LinearMethod(LinearMethodBase):
             # Normal EXL3 suffix handling (trellis, suh, svh)
             loaded = loaded_weight.detach().contiguous()
 
+            expected_out = output_partition_sizes[shard_idx]
+            if is_qkv_parallel and not is_row_parallel:
+                total_out = (
+                    int(loaded.shape[1]) * 16
+                    if suffix == "trellis"
+                    else int(loaded.shape[0])
+                )
+                shard_tp_size = max(1, total_out // expected_out)
+                shard_tp_rank = tp_rank // max(1, tp_size // shard_tp_size)
+            else:
+                shard_tp_size = tp_size
+                shard_tp_rank = tp_rank
+
             # Apply TP slicing based on layer type
             if is_row_parallel:
                 # Row-parallel: input is sharded, trellis dim 0 and suh dim 0
                 sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
             else:
                 # Column-parallel: output is sharded, trellis dim 1 and svh dim 0
-                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+                sharded = shard_exl3_col(
+                    loaded, suffix, shard_tp_rank, shard_tp_size
+                )
 
             # Copy into the right location
             if suffix == "trellis":
