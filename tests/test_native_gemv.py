@@ -6,17 +6,16 @@ def test_native_gemv_function_exists():
     try:
         import vllm_exl3_c
     except ImportError as e:
-        pytest.fail(f"vllm_exl3_c not importable: {e}")
+        pytest.skip(f"vllm_exl3_c not importable: {e}")
     assert hasattr(vllm_exl3_c, "exl3_gemv"), "vllm_exl3_c does not export exl3_gemv"
 
 def test_native_gemv_no_weight_materialization():
     """Verify that exl3_gemv streams trellis directly without materializing full weight matrix."""
     try:
         import torch
+        import vllm_exl3_c
     except ImportError:
-        pytest.skip("PyTorch required for GEMV tests")
-        
-    import vllm_exl3_c
+        pytest.skip("PyTorch and vllm_exl3_c required for GEMV tests")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         pytest.skip("CUDA device required for native GEMV tests")
@@ -51,10 +50,9 @@ def test_native_gemv_parity_and_shapes():
     """Verify that exl3_gemv output matches reference matmul across m=1,2,4,8 and K=2,3,4."""
     try:
         import torch
+        import vllm_exl3_c
     except ImportError:
-        pytest.skip("PyTorch required for GEMV tests")
-        
-    import vllm_exl3_c
+        pytest.skip("PyTorch and vllm_exl3_c required for GEMV tests")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         pytest.skip("CUDA device required for native GEMV tests")

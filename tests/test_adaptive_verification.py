@@ -1,12 +1,16 @@
 """Unit tests for adaptive verification head confidence filtering and pruning."""
 
 import pytest
-import torch
 
 from vllm_exl3.exl3 import (
     is_adaptive_verification_enabled,
     filter_speculative_candidates,
 )
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def test_adaptive_verification_env_toggle(monkeypatch):
@@ -26,6 +30,8 @@ def test_adaptive_verification_env_toggle(monkeypatch):
 
 def test_confidence_pruning_all_confident():
     """When all candidate tokens exceed threshold, all are kept."""
+    if torch is None:
+        pytest.skip("PyTorch required for tensor pruning tests")
     probs = torch.tensor([[0.9, 0.85, 0.8]])
     mask, num_tokens = filter_speculative_candidates(probs, threshold=0.7)
     assert num_tokens == 3
@@ -35,6 +41,8 @@ def test_confidence_pruning_all_confident():
 
 def test_confidence_pruning_early_cutoff():
     """When a middle token drops below threshold, subsequent tokens are pruned."""
+    if torch is None:
+        pytest.skip("PyTorch required for tensor pruning tests")
     probs = torch.tensor([[0.9, 0.4, 0.85]])
     mask, num_tokens = filter_speculative_candidates(probs, threshold=0.7)
     assert num_tokens == 1
@@ -45,6 +53,8 @@ def test_confidence_pruning_early_cutoff():
 
 def test_confidence_pruning_batch():
     """Verify independent candidate pruning per batch sequence."""
+    if torch is None:
+        pytest.skip("PyTorch required for tensor pruning tests")
     probs = torch.tensor([
         [0.95, 0.90, 0.80],
         [0.50, 0.90, 0.90]
@@ -57,6 +67,8 @@ def test_confidence_pruning_batch():
 
 def test_confidence_pruning_edge_cases():
     """Test empty edge cases."""
+    if torch is None:
+        pytest.skip("PyTorch required for tensor pruning tests")
     probs = torch.empty((1, 0))
     mask, count = filter_speculative_candidates(probs, threshold=0.5)
     assert count == 0

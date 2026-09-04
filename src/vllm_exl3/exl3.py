@@ -29,37 +29,76 @@ import os
 from typing import TYPE_CHECKING, Any
 
 import re
-import torch
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
+try:
+    import torch
+    import torch.nn.functional as F
+    from torch.nn.parameter import Parameter
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    Parameter = None  # type: ignore[assignment]
 
-from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-    FusedMoEMethodBase,
-)
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.utils import set_weight_attrs
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
-        SharedExperts,
+try:
+    from vllm.logger import init_logger
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
     )
+    from vllm.model_executor.layers.linear import (
+        LinearBase,
+        LinearMethodBase,
+        UnquantizedLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.layers.quantization import register_quantization_config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.model_executor.utils import set_weight_attrs
+    _VLLM_AVAILABLE = True
+    # Under the "vllm." hierarchy so vLLM's logging config actually emits these
+    # INFO lines; a bare module name is dropped and the load log shows nothing.
+    logger = init_logger("vllm." + __name__)
+except ImportError:
+    import logging
+    _VLLM_AVAILABLE = False
+    logger = logging.getLogger("vllm." + __name__)
 
-# Under the "vllm." hierarchy so vLLM's logging config actually emits these
-# INFO lines; a bare module name is dropped and the load log shows nothing.
-logger = init_logger("vllm." + __name__)
+    class FusedMoEQuantConfig:  # type: ignore[no-redef]
+        pass
+
+    class FusedMoEMethodBase:  # type: ignore[no-redef]
+        pass
+
+    class LinearBase:  # type: ignore[no-redef]
+        pass
+
+    class LinearMethodBase:  # type: ignore[no-redef]
+        pass
+
+    class UnquantizedLinearMethod:  # type: ignore[no-redef]
+        pass
+
+    class QuantizationConfig:  # type: ignore[no-redef]
+        pass
+
+    class QuantizeMethodBase:  # type: ignore[no-redef]
+        pass
+
+    class ParallelLMHead:  # type: ignore[no-redef]
+        pass
+
+    def register_quantization_config(name: str):  # type: ignore[no-redef]
+        def decorator(cls):
+            return cls
+        return decorator
+
+    def set_weight_attrs(param, attrs):  # type: ignore[no-redef]
+        for k, v in attrs.items():
+            setattr(param, k, v)
 
 MCG_MULTIPLIER = 0xCBAC1FED
 MCG_MARKER_SIGNED_INT32 = -877912083
@@ -424,9 +463,11 @@ def make_linear_exl3(
     mcg: torch.Tensor | None = None,
     mul1: torch.Tensor | None = None,
     *,
-    out_dtype: torch.dtype = torch.float16,
+    out_dtype: torch.dtype | None = None,
 ):
     """Build a LinearEXL3 over already-sharded packed tensors. No BF16 expand."""
+    if out_dtype is None and torch is not None:
+        out_dtype = torch.float16
     cls = load_linear_exl3_cls()
     return cls(
         config=None,
@@ -450,10 +491,15 @@ def execute_exl3_linear(
     mcg: torch.Tensor | None = None,
     mul1: torch.Tensor | None = None,
     *,
-    out_dtype: torch.dtype = torch.float32,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Real EXL3 expert GEMM entry (LinearEXL3 / exllamav3_ext)."""
-    inner = make_linear_exl3(trellis, suh, svh, mcg, mul1, out_dtype=torch.float16)
+    if out_dtype is None and torch is not None:
+        out_dtype = torch.float32
+    inner = make_linear_exl3(
+        trellis, suh, svh, mcg, mul1,
+        out_dtype=torch.float16 if torch is not None else None,
+    )
     return inner.forward(x.contiguous().half(), {}, out_dtype=out_dtype)
 
 

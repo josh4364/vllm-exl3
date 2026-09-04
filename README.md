@@ -6,7 +6,7 @@
 
 > ### Built on the work of others
 >
-> The EXL3 trellis format, the MCG codebook and the quantization method are [ExLlamaV3](https://github.com/turboderp/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)). This plugin
+> The EXL3 trellis format, the MCG codebook and the quantization method are [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)). This plugin
 > exists to serve their format.
 >
 > `csrc/exl3_fat_gemm.cu` and `.cuh` are **copied from** [Mia's AI Lab](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) ([@MiaAI-Lab](https://github.com/MiaAI-Lab), [@plotarmordev](https://github.com/plotarmordev)), with only include paths changed, and
@@ -202,7 +202,7 @@ and will be removed in a future release.
 
 This project stands on other people's work, and two projects in particular.
 
-**[ExLlamaV3](https://github.com/turboderp/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)).** The EXL3 trellis format, the
+**[ExLlamaV3](https://github.com/turboderp-org/exllamav3) by Turboderp ([@turboderp](https://github.com/turboderp)).** The EXL3 trellis format, the
 MCG codebook and the quantization method are theirs. The CUDA sources here build against ExLlamaV3's
 extension headers, and the GEMV and batched kernels reuse its kernel body. MIT, Copyright (c) 2025
 Turboderp.
