@@ -768,7 +768,7 @@ def _apply_native_fused_moe(
         return None
 
     n_exp = len(inners)
-    local = map_topk_to_local(ids, n_exp, expert_map)
+    local = map_topk_to_local(ids, n_exp, expert_map).reshape(ids.shape)
     topk = int(local.shape[-1])
     if topk < 1:
         return None
