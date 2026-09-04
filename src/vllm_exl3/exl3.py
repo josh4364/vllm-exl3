@@ -43,7 +43,11 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -728,7 +732,12 @@ def _apply_native_fused_moe(
         return None
 
     n_exp = len(inners)
-    local = map_topk_to_local(ids, n_exp, expert_map)
+    # map_topk_to_local returns a flat (tokens * topk,) tensor.  Restore the
+    # (tokens, topk) shape before indexing per row: indexing the flat tensor by
+    # row handed the kernel a single expert id and a single weight per token
+    # (and the wrong token's experts for rows >= 1), which computed 1 of the 8
+    # routed experts and produced the repetition collapse seen in serving.
+    local = map_topk_to_local(ids, n_exp, expert_map).reshape(ids.shape)
     topk = int(local.shape[-1])
     if topk < 1:
         return None
@@ -746,30 +755,34 @@ def _apply_native_fused_moe(
     native_out = torch.empty_like(xh)
     k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
     fn = module.p2b_fused_moe
-    for row in range(int(x2d.shape[0])):
-        result = fn(
-            xh[row : row + 1],
-            native_out[row : row + 1],
-            ptrs["gate_trellis"],
-            ptrs["gate_suh"],
-            ptrs["gate_svh"],
-            ptrs["up_trellis"],
-            ptrs["up_suh"],
-            ptrs["up_svh"],
-            ptrs["down_trellis"],
-            ptrs["down_suh"],
-            ptrs["down_svh"],
-            safe_ids[row],
-            safe_weights[row],
-            k,
-            k,
-            k,
-            True,
-        )
-        # pybind returns the same output tensor, while lightweight test doubles
-        # may return a fresh tensor.  Accommodate both without synchronizing.
-        if isinstance(result, torch.Tensor) and result is not native_out:
-            native_out[row : row + 1].copy_(result.reshape(1, -1))
+    # One cooperative launch covers every row of the decode batch: the kernel
+    # derives topk = ids.numel() / rows and maps (row, slot) pairs onto x rows
+    # and accumulator rows itself.  Launching once per row cost a full set of
+    # grid-wide phase barriers per token (measured 2026-09-04: 3 rows in one
+    # launch is ~2x faster than 3 launches on GB10).
+    result = fn(
+        xh,
+        native_out,
+        ptrs["gate_trellis"],
+        ptrs["gate_suh"],
+        ptrs["gate_svh"],
+        ptrs["up_trellis"],
+        ptrs["up_suh"],
+        ptrs["up_svh"],
+        ptrs["down_trellis"],
+        ptrs["down_suh"],
+        ptrs["down_svh"],
+        safe_ids.reshape(-1),
+        safe_weights.reshape(-1),
+        k,
+        k,
+        k,
+        True,
+    )
+    # pybind returns the same output tensor, while lightweight test doubles
+    # may return a fresh tensor.  Accommodate both without synchronizing.
+    if isinstance(result, torch.Tensor) and result is not native_out:
+        native_out.copy_(result.reshape_as(native_out))
     return native_out.to(dtype=torch.float32)
 
 
@@ -1371,6 +1384,11 @@ class Exl3Config(QuantizationConfig):
             return Exl3MoEMethod(
                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
             )
+        if isinstance(layer, ParallelLMHead):
+            # EXL3 head (see Exl3LMHeadMethod); anything else stays BF16.
+            if self._matches_non_routed_exl3(prefix):
+                return Exl3LMHeadMethod(self, bits=self._bits_for_non_routed(prefix))
+            return None
         if isinstance(layer, LinearBase):
             # Check if this LinearBase should use non_routed_exl3
             if self._matches_non_routed_exl3(prefix):
@@ -1675,6 +1693,115 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return apply_exl3_experts(
             x, topk_ids, topk_weights, layer, limit=float(limit)
         )
+
+
+
+class Exl3LMHeadMethod(QuantizeMethodBase):
+    """EXL3 trellis ``lm_head`` (``ParallelLMHead``) projection.
+
+    Declared through ``quantization_config.non_routed_exl3.layers`` under the
+    module prefix of the head (``language_model.lm_head`` for GLM-5.3-Flash),
+    with tensors ``lm_head.{trellis,suh,svh,mul1|mcg}`` in the pack (see
+    tools/lm_head_overlay.py).  The BF16 head is 1.27 GB and is read by the
+    target verify and by every MTP draft step; the 5-bit EXL3 head is 0.40 GB.
+    The MTP proposer replaces ``shared_head.head`` with the target's lm_head
+    module, so the drafter uses this method too.  TP > 1 is not supported.
+    """
+
+    def __init__(self, quant_config: "Exl3Config", bits: int) -> None:
+        self.quant_config = quant_config
+        self.bits = int(bits)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs: Any,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        # ParallelLMHead records its own tp_size; avoids touching the process
+        # group so the method can also be exercised outside a vLLM engine.
+        if int(getattr(layer, "tp_size", 1)) != 1:
+            raise ValueError("EXL3 lm_head requires tensor_parallel_size == 1")
+        in_f = int(input_size_per_partition)
+        out_f = int(sum(int(s) for s in output_partition_sizes))
+        if in_f % 128 or out_f % 128:
+            raise ValueError(
+                f"EXL3 lm_head needs in/out multiples of 128, got {in_f}x{out_f}"
+            )
+        k = self.bits
+        params = {
+            "trellis": Parameter(
+                torch.empty(in_f // 16, out_f // 16, 16 * k, dtype=torch.int16),
+                requires_grad=False,
+            ),
+            "suh": Parameter(torch.empty(in_f, dtype=torch.float16), requires_grad=False),
+            "svh": Parameter(torch.empty(out_f, dtype=torch.float16), requires_grad=False),
+            "mcg": Parameter(torch.zeros(1, dtype=torch.int32), requires_grad=False),
+            "mul1": Parameter(torch.zeros(1, dtype=torch.int32), requires_grad=False),
+        }
+        for name, p in params.items():
+            layer.register_parameter(name, p)
+            set_weight_attrs(p, {"weight_loader": self._load_param})
+        layer._exl3_head_shape = (in_f, out_f, k)
+
+    @staticmethod
+    def _load_param(param: Parameter, loaded_weight: torch.Tensor, *args: Any, **kwargs: Any) -> None:
+        if loaded_weight.numel() != param.data.numel():
+            raise RuntimeError(
+                f"EXL3 lm_head tensor has {tuple(loaded_weight.shape)} elements, "
+                f"parameter expects {tuple(param.data.shape)}"
+            )
+        param.data.copy_(loaded_weight.reshape(param.data.shape).to(param.data.dtype))
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not hasattr(layer, "trellis"):
+            return
+        mcg_set = int(layer.mcg.reshape(-1)[0].item()) != 0
+        mul1_set = int(layer.mul1.reshape(-1)[0].item()) != 0
+        if mcg_set == mul1_set:
+            raise RuntimeError("EXL3 lm_head: exactly one of mcg/mul1 markers must be set")
+        if mcg_set and int(layer.mcg.reshape(-1)[0].item()) != MCG_MARKER_SIGNED_INT32:
+            raise RuntimeError("EXL3 lm_head: unexpected mcg marker value")
+        if mul1_set and int(layer.mul1.reshape(-1)[0].item()) != MUL1_MARKER_SIGNED_INT32:
+            raise RuntimeError("EXL3 lm_head: unexpected mul1 marker value")
+        layer._exl3_head = make_linear_exl3(
+            layer.trellis.data,
+            layer.suh.data,
+            layer.svh.data,
+            layer.mcg.data if mcg_set else None,
+            layer.mul1.data if mul1_set else None,
+            out_dtype=torch.float16,
+        )
+        in_f, out_f, k = layer._exl3_head_shape
+        logger.info(
+            "EXL3 lm_head engaged: %dx%d K=%d (%s), %.2f GB",
+            in_f, out_f, k, "mcg" if mcg_set else "mul1",
+            layer.trellis.numel() * 2 / 1e9,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        head = getattr(layer, "_exl3_head", None)
+        if head is None:
+            raise RuntimeError("EXL3 lm_head was not built after weight load")
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1]).to(dtype=torch.float16).contiguous()
+        y = head.forward(x2, {}, out_dtype=torch.float32)
+        if bias is not None:
+            y = y + bias.to(dtype=y.dtype)
+        return y.to(dtype=x.dtype).reshape(*shape[:-1], y.shape[-1])
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("EXL3 lm_head does not serve as an input embedding")
 
 
 class Exl3LinearMethod(LinearMethodBase):
