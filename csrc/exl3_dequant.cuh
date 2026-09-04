@@ -41,16 +41,48 @@ inline std::uint16_t float_to_half_bits(float value) {
     std::uint32_t raw;
     std::memcpy(&raw, &value, sizeof(raw));
     const std::uint32_t sign = (raw >> 16) & 0x8000u;
-    const int exp = static_cast<int>((raw >> 23) & 0xFFu) - 127;
+    const std::uint32_t exp_bits = (raw >> 23) & 0xFFu;
     const std::uint32_t mant = raw & 0x7FFFFFu;
-    if (exp > 15) return static_cast<std::uint16_t>(sign | 0x7C00u);
-    if (exp < -14) {
-        if (exp < -24) return static_cast<std::uint16_t>(sign);
-        const std::uint32_t m = (mant | 0x800000u) >> (-exp - 1);
-        return static_cast<std::uint16_t>(sign | (m >> 13));
+    if (exp_bits == 0xFFu) {
+        if (mant == 0) return static_cast<std::uint16_t>(sign | 0x7C00u);
+        // Preserve a non-zero NaN payload and force the quiet-NaN bit.
+        std::uint32_t payload = mant >> 13;
+        payload |= 0x200u;
+        return static_cast<std::uint16_t>(sign | 0x7C00u | (payload & 0x3FFu));
     }
-    return static_cast<std::uint16_t>(sign |
-        (static_cast<std::uint32_t>(exp + 15) << 10) | (mant >> 13));
+
+    const int exp = static_cast<int>(exp_bits) - 127;
+    const std::uint32_t significand = mant | 0x800000u;
+    if (exp < -14) {
+        // A half subnormal is significand * 2^-24.  Round the float
+        // significand to that unit with ties-to-even, including the carry
+        // into the smallest normal half (0x0400).
+        const int shift = -exp - 1;
+        if (shift >= 32) return static_cast<std::uint16_t>(sign);
+        std::uint32_t rounded = significand >> shift;
+        const std::uint32_t remainder = significand & ((1u << shift) - 1u);
+        const std::uint32_t halfway = 1u << (shift - 1);
+        if (remainder > halfway ||
+            (remainder == halfway && (rounded & 1u))) {
+            ++rounded;
+        }
+        return static_cast<std::uint16_t>(sign | (rounded & 0x7FFu));
+    }
+
+    std::uint32_t rounded_mant = mant >> 13;
+    const std::uint32_t remainder = mant & 0x1FFFu;
+    if (remainder > 0x1000u ||
+        (remainder == 0x1000u && (rounded_mant & 1u))) {
+        ++rounded_mant;
+    }
+    int half_exp = exp + 15;
+    if (rounded_mant == 0x400u) {
+        rounded_mant = 0;
+        ++half_exp;
+    }
+    if (half_exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
+    return static_cast<std::uint16_t>(
+        sign | (static_cast<std::uint32_t>(half_exp) << 10) | rounded_mant);
 }
 
 inline std::uint16_t half_add_bits(std::uint16_t a, std::uint16_t b) {
