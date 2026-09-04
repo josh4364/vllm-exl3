@@ -97,6 +97,10 @@ MUL1_MARKER_SIGNED_INT32 = -2082680531
 EXL3_SUFFIXES = ("trellis", "suh", "svh", "mcg", "mul1")
 SWIGLU_LIMIT_DEFAULT = 10.0
 TEMP_ROWS_FUSED = 2048
+try:
+    FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
+except (TypeError, ValueError):
+    FAT_EXPERT_THRESHOLD = 256
 MOE_ACT_SILU = 0
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -858,7 +862,7 @@ def _apply_native_fused_moe(
     return native_out.to(dtype=torch.float32)
 
 
-_FAT_SCRATCH_CACHE: dict[tuple[str, int, int, int], dict[str, torch.Tensor]] = {}
+_FAT_SCRATCH_CACHE: dict[tuple[str, int, int, int, int], dict[str, torch.Tensor]] = {}
 
 
 def _fat_scratch(
@@ -866,7 +870,9 @@ def _fat_scratch(
 ) -> dict[str, torch.Tensor]:
     hidden = int(getattr(gate, "in_features", 4096))
     intermediate = int(getattr(gate, "out_features", 2048))
-    key = (str(device), capacity, intermediate, hidden)
+    k_words = int(gate.trellis.shape[2])
+    bucketed_cap = max(256, ((int(capacity) + 255) // 256) * 256)
+    key = (str(device), bucketed_cap, intermediate, hidden, k_words)
     scratch = _FAT_SCRATCH_CACHE.get(key)
     if scratch is not None:
         return scratch
@@ -888,25 +894,31 @@ def _fat_scratch(
             (intermediate, hidden), dtype=torch.float16, device=device
         ),
         "h": torch.empty(
-            (capacity, hidden), dtype=torch.float16, device=device
+            (bucketed_cap, hidden), dtype=torch.float16, device=device
         ),
         "h13": torch.empty(
-            (capacity, hidden), dtype=torch.float16, device=device
+            (bucketed_cap, hidden), dtype=torch.float16, device=device
         ),
         "gate_up": torch.empty(
-            (capacity, 2 * intermediate), dtype=torch.float32, device=device
+            (bucketed_cap, 2 * intermediate), dtype=torch.float32, device=device
         ),
         "act": torch.empty(
-            (capacity, intermediate), dtype=torch.float32, device=device
+            (bucketed_cap, intermediate), dtype=torch.float32, device=device
         ),
         "act_h": torch.empty(
-            (capacity, intermediate), dtype=torch.float16, device=device
+            (bucketed_cap, intermediate), dtype=torch.float16, device=device
         ),
         "h2": torch.empty(
-            (capacity, intermediate), dtype=torch.float16, device=device
+            (bucketed_cap, intermediate), dtype=torch.float16, device=device
         ),
         "down": torch.empty(
-            (capacity, hidden), dtype=torch.float32, device=device
+            (bucketed_cap, hidden), dtype=torch.float32, device=device
+        ),
+        "w_gate": torch.empty(
+            (hidden, intermediate), dtype=torch.float16, device=device
+        ),
+        "w_up": torch.empty(
+            (hidden, intermediate), dtype=torch.float16, device=device
         ),
     }
     _FAT_SCRATCH_CACHE[key] = scratch
@@ -915,13 +927,7 @@ def _fat_scratch(
 
 def _fat_kernel_available() -> bool:
     native_c = _load_native_exl3_ext()
-    if native_c and hasattr(native_c, "exl3_fat_gemm"):
-        return True
-    try:
-        ext = load_exllamav3_ext()
-        return hasattr(ext, "exl3_fat_gemm")
-    except Exception:
-        return False
+    return bool(native_c and hasattr(native_c, "exl3_fat_gemm"))
 
 
 def apply_exl3_batched_fat(
@@ -937,11 +943,7 @@ def apply_exl3_batched_fat(
 ) -> torch.Tensor:
     """Run fat experts with persistent scratch and accelerated 128x128 CUDA GEMM."""
     native_c = _load_native_exl3_ext()
-    ext = (
-        native_c
-        if (native_c and hasattr(native_c, "exl3_fat_gemm"))
-        else load_exllamav3_ext()
-    )
+    ext = load_exllamav3_ext()
     offset = 0
     for e, n_rows in enumerate(counts_host):
         start = offset
@@ -959,7 +961,9 @@ def apply_exl3_batched_fat(
         h = scratch["h"][:n_rows]
         h13 = scratch["h13"][:n_rows]
         torch.index_select(xh, 0, token_idx, out=h)
-        ext.had_r_128(h, h13, gate.suh, None, 1.0)
+        distinct_suh = not torch.equal(gate.suh, up.suh)
+        if not distinct_suh:
+            ext.had_r_128(h, h13, gate.suh, None, 1.0)
 
         packed13 = scratch["packed13"]
         out_tiles = int(gate.trellis.shape[1])
@@ -974,15 +978,49 @@ def apply_exl3_batched_fat(
         mcg = bool(getattr(gate, "mcg", True))
         mul1 = bool(getattr(gate, "mul1", False))
 
-        if use_kernel and k == 4 and hasattr(ext, "exl3_fat_gemm"):
-            ext.exl3_fat_gemm(
+        if (
+            not distinct_suh
+            and use_kernel
+            and k == 4
+            and mcg
+            and not mul1
+            and native_c is not None
+            and hasattr(native_c, "exl3_fat_gemm")
+        ):
+            native_c.exl3_fat_gemm(
                 h13, packed13, gate_up, svh13, k, mcg, mul1
             )
         else:
-            w13 = scratch["w13"]
-            ext.reconstruct(w13, packed13, k, mcg, mul1)
-            ext.hgemm(h13, w13, gate_up)
-            ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
+            if distinct_suh:
+                gate_h = h13
+                up_h = h
+                ext.had_r_128(h, gate_h, gate.suh, None, 1.0)
+                ext.had_r_128(up_h, up_h, up.suh, None, 1.0)
+                w_gate = scratch["w_gate"]
+                w_up = scratch["w_up"]
+                ext.reconstruct(w_gate, gate.trellis, k, mcg, mul1)
+                ext.reconstruct(w_up, up.trellis, k, mcg, mul1)
+                ext.hgemm(gate_h, w_gate, gate_up[:, :intermediate])
+                ext.hgemm(up_h, w_up, gate_up[:, intermediate:])
+                ext.had_r_128(
+                    gate_up[:, :intermediate],
+                    gate_up[:, :intermediate],
+                    None,
+                    gate.svh,
+                    1.0,
+                )
+                ext.had_r_128(
+                    gate_up[:, intermediate:],
+                    gate_up[:, intermediate:],
+                    None,
+                    up.svh,
+                    1.0,
+                )
+            else:
+                w13 = scratch["w13"]
+                ext.reconstruct(w13, packed13, k, mcg, mul1)
+                ext.hgemm(h13, w13, gate_up)
+                ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
 
         gate_out = gate_up[:, :intermediate]
         up_out = gate_up[:, intermediate:]
@@ -997,8 +1035,16 @@ def apply_exl3_batched_fat(
 
         h2 = scratch["h2"][:n_rows]
         ext.had_r_128(act_h, h2, down.suh, None, 1.0)
-        if use_kernel and k == 4 and hasattr(ext, "exl3_fat_gemm_scatter"):
-            ext.exl3_fat_gemm_scatter(
+        if (
+            not distinct_suh
+            and use_kernel
+            and k == 4
+            and mcg
+            and not mul1
+            and native_c is not None
+            and hasattr(native_c, "exl3_fat_gemm_scatter")
+        ):
+            native_c.exl3_fat_gemm_scatter(
                 h2,
                 down.trellis,
                 out,
@@ -1070,9 +1116,6 @@ def apply_exl3_fused_moe(
     topk = int(ids.shape[-1])
     flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
     flat_weight = weights.reshape(-1).to(dtype=torch.float16)
-    order = local.argsort()
-    token_sorted = flat_token[order]
-    weight_sorted = flat_weight[order]
     # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
     expert_count = torch.zeros(n_exp + 1, dtype=torch.long, device=local.device)
     expert_count.scatter_add_(
@@ -1100,6 +1143,29 @@ def apply_exl3_fused_moe(
                 x2d[s:e], ids[s:e], weights[s:e], layer, inners, expert_map, limit
             )
         return out
+
+    fat = counts > FAT_EXPERT_THRESHOLD
+    fat_route = torch.zeros_like(local, dtype=torch.bool)
+    if bool(fat.any().item()):
+        safe_local = local.clamp(min=0, max=max(n_exp - 1, 0))
+        fat_route = (local < n_exp) & fat.index_select(0, safe_local)
+
+    # The standard kernel handles non-fat routes. Fat routes are represented by
+    # the invalid sentinel with zero weight here and are dispatched exactly once
+    # below through the fat GEMM path.
+    standard_local = local.masked_fill(fat_route, n_exp)
+    standard_weight = flat_weight.masked_fill(fat_route, 0)
+    order = standard_local.argsort()
+    token_sorted = flat_token[order]
+    weight_sorted = standard_weight[order]
+    standard_count = torch.zeros(
+        n_exp + 1, dtype=torch.long, device=local.device
+    )
+    standard_count.scatter_add_(
+        0,
+        standard_local.long(),
+        torch.ones(standard_local.shape, dtype=torch.long, device=local.device),
+    )
     fn = exllamav3_ext.exl3_moe
     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
@@ -1108,7 +1174,7 @@ def apply_exl3_fused_moe(
     args = (
         xh,
         out,
-        expert_count,
+        standard_count,
         token_sorted,
         weight_sorted,
         temps[0],
@@ -1141,33 +1207,19 @@ def apply_exl3_fused_moe(
     else:
         fn(*args)
 
-    if tokens > TEMP_ROWS_FUSED:
-        fat = (counts > TEMP_ROWS_FUSED).nonzero(as_tuple=False).view(-1)
-        if fat.numel():
-            if _fat_kernel_available():
-                counts_list = counts.tolist()
-                apply_exl3_batched_fat(
-                    xh,
-                    token_sorted,
-                    weight_sorted,
-                    counts_list,
-                    inners,
-                    limit,
-                    TEMP_ROWS_FUSED,
-                    out,
-                    use_kernel=True,
-                )
-            else:
-                apply_exl3_python_loop(
-                    x2d,
-                    ids,
-                    weights,
-                    inners,
-                    expert_map,
-                    limit,
-                    only_experts=set(int(i) for i in fat.tolist()),
-                    out=out,
-                )
+    if bool(fat.any().item()):
+        fat_order = local.argsort()
+        apply_exl3_batched_fat(
+            xh,
+            flat_token[fat_order],
+            flat_weight[fat_order],
+            counts.tolist(),
+            inners,
+            limit,
+            FAT_EXPERT_THRESHOLD,
+            out,
+            use_kernel=_fat_kernel_available(),
+        )
     return out
 
 
