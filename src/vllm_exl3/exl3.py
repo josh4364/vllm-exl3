@@ -206,12 +206,8 @@ def validate_context_scaling(
     ``chunk_size`` is reported so callers can associate the result with their
     chunked-prefill configuration; it does not alter the static KV footprint.
     """
-    if isinstance(max_model_len, bool):
-        raise ValueError("max_model_len must be positive")
-    try:
-        max_model_len = int(max_model_len)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("max_model_len must be positive") from exc
+    if isinstance(max_model_len, bool) or not isinstance(max_model_len, int):
+        raise ValueError("max_model_len must be a positive integer")
     if max_model_len <= 0:
         raise ValueError("max_model_len must be positive")
 
@@ -219,19 +215,16 @@ def validate_context_scaling(
         float(model_weights_gb),
         "VLLM_EXL3_CONTEXT_MODEL_WEIGHTS_GB",
         "VLLM_EXL3_MODEL_WEIGHTS_GB",
-        minimum=0.0,
     )
     total_mem_gb = _env_float_override(
         float(total_mem_gb),
         "VLLM_EXL3_CONTEXT_TOTAL_MEM_GB",
         "VLLM_EXL3_TOTAL_MEM_GB",
-        minimum=0.0,
     )
     mem_util = _env_float_override(
         float(mem_util),
         "VLLM_EXL3_CONTEXT_MEM_UTIL",
         "VLLM_EXL3_MEM_UTIL",
-        minimum=0.0,
     )
     chunk_size = _env_int_override(
         int(chunk_size),
@@ -239,6 +232,13 @@ def validate_context_scaling(
         "VLLM_EXL3_CHUNK_SIZE",
         minimum=1,
     )
+
+    if not math.isfinite(model_weights_gb) or model_weights_gb < 0:
+        raise ValueError("model_weights_gb must be finite and non-negative")
+    if not math.isfinite(total_mem_gb) or total_mem_gb <= 0:
+        raise ValueError("total_mem_gb must be finite and positive")
+    if not math.isfinite(mem_util) or not 0.0 < mem_util <= 1.0:
+        raise ValueError("mem_util must be finite and in (0.0, 1.0]")
 
     kv_cache_bytes = compute_mla_kv_cache_bytes(max_model_len)
     kv_cache_gb = kv_cache_bytes / (1024**3)
@@ -371,6 +371,8 @@ def is_adaptive_verification_enabled() -> bool:
 def filter_speculative_candidates(
     probs: torch.Tensor,
     threshold: float = 0.5,
+    *,
+    return_tensor: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | int]:
     """Keep the confident prefix of each speculative candidate sequence.
 
@@ -378,8 +380,18 @@ def filter_speculative_candidates(
     ``threshold``, that candidate and every later candidate in the same
     sequence are pruned.  A one-dimensional input is treated as one sequence
     and returns a Python ``int`` count; batched inputs return one ``long``
-    count per leading sequence.
+    count per leading sequence. ``return_tensor=True`` keeps a one-dimensional
+    result's count as a scalar tensor instead of synchronizing to a Python int.
     """
+    if isinstance(threshold, bool):
+        raise ValueError("threshold must be finite and in [0.0, 1.0]")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("threshold must be finite and in [0.0, 1.0]") from exc
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be finite and in [0.0, 1.0]")
+
     if not isinstance(probs, torch.Tensor):
         raise TypeError(f"probs must be a torch.Tensor, got {type(probs).__name__}")
 
@@ -390,7 +402,8 @@ def filter_speculative_candidates(
     if num_candidates == 0:
         mask = torch.zeros_like(probs, dtype=torch.bool)
         if probs.ndim == 1:
-            return mask, 0
+            count = torch.zeros((), dtype=torch.long, device=probs.device)
+            return mask, count if return_tensor else 0
         return mask, torch.zeros(probs.shape[:-1], dtype=torch.long, device=probs.device)
 
     confident = torch.ge(probs, threshold)
@@ -400,7 +413,7 @@ def filter_speculative_candidates(
     mask = torch.cumprod(confident.to(dtype=torch.int64), dim=-1).to(dtype=torch.bool)
     kept_counts = mask.sum(dim=-1, dtype=torch.long)
     if probs.ndim == 1:
-        return mask, int(kept_counts.item())
+        return mask, kept_counts if return_tensor else int(kept_counts.item())
     return mask, kept_counts
 
 
@@ -1546,13 +1559,26 @@ class Exl3Config(QuantizationConfig):
                 from vllm.model_executor.layers.quantization import (
                     get_quantization_config,
                 )
-                for name in ("deepseek_v4_fp8", str(nrq.get("quant_method"))):
-                    try:
-                        cls = get_quantization_config(name)
-                        self._nr_delegate_cached = cls.from_config(dict(nrq))
-                        break
-                    except Exception:
-                        continue
+                name = str(nrq["quant_method"])
+                try:
+                    cls = get_quantization_config(name)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Unable to load declared non_routed_quantization delegate "
+                        f"quant_method={name!r} config={nrq!r}"
+                    ) from exc
+                if cls is None:
+                    raise ValueError(
+                        "Declared non_routed_quantization delegate is unavailable: "
+                        f"quant_method={name!r} config={nrq!r}"
+                    )
+                try:
+                    self._nr_delegate_cached = cls.from_config(dict(nrq))
+                except Exception as exc:
+                    raise ValueError(
+                        "Invalid declared non_routed_quantization delegate "
+                        f"quant_method={name!r} config={nrq!r}"
+                    ) from exc
         return self._nr_delegate_cached
 
 

@@ -9,7 +9,7 @@ description = "EXL3 (ExLlamaV3 trellis/MCG) quantization plugin for vLLM fork ru
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "Victor Cruz" }]
 keywords = ["vllm", "exl3", "exllamav3", "quantization", "moe", "dgx-spark"]
 
@@ -26,4 +26,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-
