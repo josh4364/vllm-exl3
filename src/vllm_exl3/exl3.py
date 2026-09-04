@@ -10,17 +10,16 @@ work, Copyright (c) 2025 Turboderp, MIT. See THIRD_PARTY_NOTICES.md.
 """
 
 # SPDX-License-Identifier: Apache-2.0
-"""EXL3/MCG trellis quantization for GLM-5.3-Flash routed experts.
-
-Checkpoint ABI used by this pack:
-  quant_method=exl3, codebook=mcg, scope=glm53_routed_experts_only
-  per expert matrix: trellis (int16) + suh/svh (fp16) + mcg (int32 marker)
-
-Non-routed tensors stay native (UnquantizedLinearMethod). Experts never
-expand to a persistent BF16 weight; LinearEXL3 / exllamav3_ext runs the
-trellis GEMM. TP=2 shards gate/up column-wise and down row-wise; the MoE
-runner all-reduces the combined output.
-"""
+# EXL3/MCG trellis quantization for GLM-5.3-Flash routed experts.
+#
+# Checkpoint ABI used by this pack:
+#   quant_method=exl3, codebook=mcg, scope=glm53_routed_experts_only
+#   per expert matrix: trellis (int16) + suh/svh (fp16) + mcg (int32 marker)
+#
+# Non-routed tensors stay native (UnquantizedLinearMethod). Experts never
+# expand to a persistent BF16 weight; LinearEXL3 / exllamav3_ext runs the
+# trellis GEMM. TP=2 shards gate/up column-wise and down row-wise; the MoE
+# runner all-reduces the combined output.
 
 from __future__ import annotations
 
@@ -67,6 +66,116 @@ TEMP_ROWS_FUSED = 2048
 MOE_ACT_SILU = 0
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+# The schedule is deliberately expressed as inclusive ranges.  Keeping the
+# policy here (rather than in a serving script) lets vLLM callers use the same
+# batch-adaptive behaviour regardless of how the plugin is loaded.
+DEFAULT_SPECULATIVE_SCHEDULE: list[tuple[int, int, int]] = [
+    (1, 4, 3),
+    (5, 8, 2),
+    (9, 16, 1),
+]
+SPECULATIVE_SCHEDULE_ENV = "VLLM_EXL3_SPEC_SCHEDULE"
+
+
+def _validated_speculative_schedule(schedule: object) -> list[tuple[int, int, int]] | None:
+    """Return a normalized schedule, or ``None`` when it is invalid.
+
+    A schedule with overlapping ranges is ambiguous, so it is rejected rather
+    than silently depending on item order.  Gaps are valid and intentionally
+    return zero draft tokens for the uncovered batch sizes.
+    """
+    if not isinstance(schedule, (list, tuple)) or not schedule:
+        return None
+
+    normalized: list[tuple[int, int, int]] = []
+    for entry in schedule:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            return None
+        values: list[int] = []
+        for value in entry:
+            # Do not silently truncate floats (or accept booleans, which are
+            # ``int`` subclasses) in a serving policy supplied by a caller.
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                values.append(value)
+                continue
+            if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+                values.append(int(value.strip(), 10))
+                continue
+            return None
+        min_bs, max_bs, draft_tokens = values
+        if min_bs < 1 or max_bs < min_bs or draft_tokens < 0:
+            return None
+        normalized.append((min_bs, max_bs, draft_tokens))
+
+    normalized.sort(key=lambda item: (item[0], item[1], item[2]))
+    for previous, current in zip(normalized, normalized[1:]):
+        if current[0] <= previous[1]:
+            return None
+    return normalized
+
+
+def parse_speculative_schedule(schedule_str: str) -> list[tuple[int, int, int]]:
+    """Parse ``min_batch:max_batch:draft_tokens`` schedule entries.
+
+    Invalid, empty, or ambiguous values safely fall back to a fresh copy of
+    :data:`DEFAULT_SPECULATIVE_SCHEDULE`.  Returning a copy prevents a caller
+    from mutating the process-wide default policy accidentally.
+    """
+    if not isinstance(schedule_str, str) or not schedule_str.strip():
+        return list(DEFAULT_SPECULATIVE_SCHEDULE)
+
+    entries: list[list[int]] = []
+    try:
+        for raw_entry in schedule_str.split(","):
+            fields = [field.strip() for field in raw_entry.split(":")]
+            if len(fields) != 3 or any(not field for field in fields):
+                raise ValueError("each schedule entry must contain three integers")
+            entries.append([int(field, 10) for field in fields])
+    except (TypeError, ValueError, OverflowError):
+        return list(DEFAULT_SPECULATIVE_SCHEDULE)
+
+    normalized = _validated_speculative_schedule(entries)
+    return normalized if normalized is not None else list(DEFAULT_SPECULATIVE_SCHEDULE)
+
+
+def get_speculative_draft_tokens(
+    batch_size: int,
+    schedule: list | None = None,
+) -> int:
+    """Return the draft-token count for a scheduler batch size.
+
+    ``schedule`` overrides :envvar:`VLLM_EXL3_SPEC_SCHEDULE`.  When neither is
+    supplied, the default policy is 3/2/1 draft tokens for batches 1--4,
+    5--8, and 9--16 respectively; all other batch sizes return zero.
+    """
+    try:
+        batch_size = int(batch_size)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if batch_size <= 0:
+        return 0
+
+    if schedule is None:
+        configured = os.environ.get(SPECULATIVE_SCHEDULE_ENV)
+        active_schedule = (
+            parse_speculative_schedule(configured)
+            if configured is not None
+            else list(DEFAULT_SPECULATIVE_SCHEDULE)
+        )
+    elif isinstance(schedule, str):
+        active_schedule = parse_speculative_schedule(schedule)
+    else:
+        active_schedule = _validated_speculative_schedule(schedule)
+        if active_schedule is None:
+            active_schedule = list(DEFAULT_SPECULATIVE_SCHEDULE)
+
+    for min_bs, max_bs, draft_tokens in active_schedule:
+        if min_bs <= batch_size <= max_bs:
+            return draft_tokens
+    return 0
 
 
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
