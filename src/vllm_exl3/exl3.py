@@ -602,7 +602,7 @@ def apply_exl3_python_loop(
     weights: torch.Tensor,
     inners: list[dict[str, Any]],
     expert_map: torch.Tensor | None,
-    limit: float,
+    limit: float | None = None,
     *,
     only_experts: set[int] | None = None,
     out: torch.Tensor | None = None,
@@ -631,7 +631,10 @@ def apply_exl3_python_loop(
         pack = inners[e]
         gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
         up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
-        act = F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+        if limit is not None and limit > 0:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        act = F.silu(gate) * up
         down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
         out.index_add_(0, token_idx, down * scale)
@@ -712,9 +715,14 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
 
 
 def _native_moe_dimensions_supported(
-    x2d: torch.Tensor, layer: torch.nn.Module, inners: list[dict[str, Any]]
+    x2d: torch.Tensor,
+    layer: torch.nn.Module,
+    inners: list[dict[str, Any]],
+    limit: float | None = None,
 ) -> bool:
     """The current native fused kernel is specialized to the DSV4/GLM5 tile."""
+    if limit is not None:
+        return False
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
     return (
@@ -736,6 +744,7 @@ def _apply_native_fused_moe(
     layer: torch.nn.Module,
     inners: list[dict[str, Any]],
     expert_map: torch.Tensor | None,
+    limit: float | None = None,
 ) -> torch.Tensor | None:
     """Run the native cooperative kernel for decode rows when it is safe.
 
@@ -747,8 +756,12 @@ def _apply_native_fused_moe(
     routing weight, preventing an out-of-bounds read while preserving fallback
     semantics.
     """
+    if limit is not None:
+        return None
     module = _load_native_exl3_ext()
-    if module is None or not _native_moe_dimensions_supported(x2d, layer, inners):
+    if module is None or not _native_moe_dimensions_supported(
+        x2d, layer, inners, limit
+    ):
         return None
     ptrs = getattr(layer, "_exl3_ptrs", None)
     if not isinstance(ptrs, dict):
@@ -885,7 +898,7 @@ def apply_exl3_batched_fat(
     weight_sorted: torch.Tensor,
     counts_host: list[int],
     inners: list[dict[str, Any]],
-    limit: float,
+    limit: float | None,
     cap: int,
     out: torch.Tensor,
     use_kernel: bool = True,
@@ -941,8 +954,9 @@ def apply_exl3_batched_fat(
 
         gate_out = gate_up[:, :intermediate]
         up_out = gate_up[:, intermediate:]
-        gate_out.clamp_(max=limit)
-        up_out.clamp_(min=-limit, max=limit)
+        if limit is not None and limit > 0:
+            gate_out.clamp_(max=limit)
+            up_out.clamp_(min=-limit, max=limit)
         act = scratch["act"][:n_rows]
         torch.sigmoid(gate_out, out=act)
         act.mul_(gate_out).mul_(up_out)
@@ -981,7 +995,7 @@ def apply_exl3_fused_moe(
     layer: torch.nn.Module,
     inners: list[dict[str, Any]],
     expert_map: torch.Tensor | None,
-    limit: float,
+    limit: float | None = None,
 ) -> torch.Tensor:
     """One exl3_moe launch per layer. Experts with count > 128 fall back to LinearEXL3."""
     tokens, hidden = x2d.shape
@@ -992,7 +1006,7 @@ def apply_exl3_fused_moe(
     if get_moe_kernel_backend() == "native":
         try:
             native_out = _apply_native_fused_moe(
-                x2d, ids, weights, layer, inners, expert_map
+                x2d, ids, weights, layer, inners, expert_map, limit
             )
         except Exception as exc:
             native_out = None
@@ -1088,7 +1102,7 @@ def apply_exl3_fused_moe(
         False,
         True,
         False,
-        float(limit),
+        float(limit) if (limit is not None and limit > 0) else 0.0,
     )
     if n_active_host is not None:
         fn(*args, n_active_host)
@@ -1131,7 +1145,7 @@ def apply_exl3_experts(
     topk_weights: torch.Tensor,
     layer: torch.nn.Module,
     *,
-    limit: float = SWIGLU_LIMIT_DEFAULT,
+    limit: float | None = None,
     fused: bool | None = None,
 ) -> torch.Tensor:
     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
@@ -1150,21 +1164,30 @@ def apply_exl3_experts(
     # ExLlamaV3/Python implementations below.
     backend = get_moe_kernel_backend()
     if backend == "native" and (fused is not False):
-        try:
-            native_out = _apply_native_fused_moe(
-                x2d, ids, weights, layer, inners, expert_map
-            )
-        except Exception as exc:
-            native_out = None
-            layer._exl3_native_error = repr(exc)
-            logger.warning_once(
-                "Native EXL3 MoE dispatch failed; falling back to %s: %s",
+        if limit is not None:
+            warn_once = getattr(logger, "warning_once", logger.warning)
+            warn_once(
+                "Native EXL3 MoE kernel does not support SwiGLU clamping "
+                "(limit=%s); falling back to %s",
+                limit,
                 "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
-                exc,
             )
-        if native_out is not None:
-            layer._exl3_last_apply = "native"
-            return native_out.to(dtype=x.dtype)
+        else:
+            try:
+                native_out = _apply_native_fused_moe(
+                    x2d, ids, weights, layer, inners, expert_map, limit
+                )
+            except Exception as exc:
+                native_out = None
+                layer._exl3_native_error = repr(exc)
+                logger.warning_once(
+                    "Native EXL3 MoE dispatch failed; falling back to %s: %s",
+                    "ExLlamaV3" if _exllamav3_moe_available() else "Python loop",
+                    exc,
+                )
+            if native_out is not None:
+                layer._exl3_last_apply = "native"
+                return native_out.to(dtype=x.dtype)
 
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
@@ -1711,9 +1734,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         del shared_experts, shared_experts_input
-        limit = getattr(self.moe, "swiglu_limit", None) or SWIGLU_LIMIT_DEFAULT
+        raw_limit = getattr(self.moe, "swiglu_limit", None)
+        try:
+            parsed_limit = float(raw_limit)
+        except (TypeError, ValueError, OverflowError):
+            parsed_limit = None
+        limit = (
+            parsed_limit
+            if parsed_limit is not None
+            and math.isfinite(parsed_limit)
+            and parsed_limit > 0
+            else None
+        )
         return apply_exl3_experts(
-            x, topk_ids, topk_weights, layer, limit=float(limit)
+            x, topk_ids, topk_weights, layer, limit=limit
         )
 
 
