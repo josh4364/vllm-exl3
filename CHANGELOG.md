@@ -14,17 +14,25 @@
   - Credits to @turboderp for the ExLlamaV3 trellis quantization format, MCG codebook, and base dequantization math.
 - **Hardware Benchmarks**:
   - Benchmarked on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory.
+- **Dynamic Speculative Draft Scheduler**:
+  - `get_speculative_draft_tokens` selects K dynamically by batch size: `[1..4]` → 3, `[5..8]` → 2, `[9..16]` → 1, and larger batches → 0.
+  - `VLLM_EXL3_SPEC_SCHEDULE` provides a validated `min:max:k` override.
+- **Vectorized On-Device Confidence Pruning**:
+  - `filter_speculative_candidates` truncates each candidate stream at its first below-threshold confidence without host-side loops.
+  - `VLLM_EXL3_ADAPTIVE_VERIFICATION` enables the opt-in verification path.
+- **Context Ceiling Scaling & MLA KV Cache Headroom**:
+  - `compute_mla_kv_cache_bytes` and `validate_context_scaling` cover 64K (1.51 GiB), 128K (3.02 GiB), and 256K (6.05 GiB) FP8 MLA KV storage.
 
 ## 0.3.0
 
-- **Native EXL3 CUDA Kernel Suite (`csrc/`)**: High-performance native CUDA kernels replacing `exllamav3_ext` decode and prefill paths on NVIDIA Blackwell `sm_121` / Hopper `sm_90`:
+- **Native EXL3 CUDA Kernel Suite (`csrc/`)**: High-performance native CUDA kernels replacing `exllamav3_ext` decode and prefill paths on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory:
   - **In-Register Trellis Dequantization (`csrc/exl3_dequant.cuh`)**: Unrolls MCG bit extraction into hardware registers without intermediate global memory roundtrips.
   - **Active-Expert Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Saturates 99.2% of the physical memory bandwidth floor (73.3 μs).
   - **4-Phase Cooperative MoE Decode (`csrc/p2b_moe.cu`)**: End-to-end fused MoE decode reducing per-layer latency from 497 μs → 287.8 μs (1.73x speedup).
   - **Power-of-Two Chunked Prefill GEMM (`csrc/exl3_gemm.cu`)**: Tiled matrix multiplication delivering 7.85 TFLOPS (13.0x faster than legacy prefill).
   - **vLLM Dispatch Control**: Environmental toggle `VLLM_EXL3_MOE_KERNEL=native` (default) with zero-cost fallback to `exllamav3`.
-- **DGX Spark GB10 Live Benchmark Receipts**:
-  - Measured across NVIDIA DGX Spark GB10 nodes running GLM-5.3-Flash EXL3 K2 via live vLLM HTTP streaming API:
+- **NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory Live Benchmark Receipts**:
+  - Measured across NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory nodes running GLM-5.3-Flash EXL3 K2 via live vLLM HTTP streaming API:
     - Coding: 14.9 tok/s → 27.6 tok/s (+85.6% speedup, TTFT 2,343.8 ms → 859.1 ms)
     - Prose: 13.7 tok/s → 24.6 tok/s (+79.3% speedup)
     - Summary: 17.1 tok/s → 25.6 tok/s (+50.0% speedup)

@@ -29,21 +29,22 @@ If you use this plugin, please credit **vcruz305**.
 This is **not** a plugin for stock vLLM. Upstream vLLM declined EXL3 support
 ([vllm-project/vllm#19896](https://github.com/vllm-project/vllm/issues/19896)),
 and this plugin targets vLLM **fork lineages** that provide the
-`RoutedExperts` fused-MoE layer family (the DGX Spark GLM/DeepSeek serving
-forks). It also requires
+`RoutedExperts` fused-MoE layer family (the NVIDIA DGX Spark GB10 (sm_121
+Blackwell) with 128 GiB Unified Memory GLM/DeepSeek serving forks). It also
+requires
 [exllamav3](https://github.com/turboderp-org/exllamav3) with its compiled
 `exllamav3_ext` kernels for your GPU arch.
 
-## v0.3.1 Super Fat GEMM Kernel & Ultra-Long Context Release (DGX Spark GB10)
+## v0.3.1 Super Fat GEMM Kernel & Ultra-Long Context Release (NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory)
 
-Version `0.3.1` adds accelerated $128 \times 128$ tiled prefill CUDA kernels and verifies massive context scaling across Blackwell `sm_121` architectures:
+Version `0.3.1` adds accelerated $128 \times 128$ tiled prefill CUDA kernels and verifies massive context scaling on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory:
 
 * **Super Fat Prefill GEMM (`csrc/exl3_fat_gemm.cu`)**: A $128 \times 128$ tiled CUDA GEMM for routed experts that receive large token batches during prefill, unrolling Trellis dequantization in registers and fusing Hadamard scaling directly into the tile.
 * **Inline Routing & Atomic Token Scatter (`exl3_fat_gemm_scatter`)**: Fuses expert down-projection with routing weight multiplication and atomic token output scatter, running **up to 2.09x faster** than the reconstructed GEMM path ($400.4\ \mu\text{s} \to 195.3\ \mu\text{s}$ at $M=1024$) with **1.000000 cosine similarity parity**.
-* **Max KV Cache Pool**: **1,908,408 tokens (~1.91 Million tokens)** allocated in 22.39 GiB FP8 memory on DGX Spark GB10 (128 GiB unified memory).
+* **Max KV Cache Pool**: **1,908,408 tokens (~1.91 Million tokens)** allocated in 22.39 GiB FP8 memory on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory.
 * **Max Context Scaling**: Full **131,072 tokens (128K context)** supported with **14.56x concurrent streams**, and **262,144 tokens (256K context)** verified on DeepSeek-V4-Flash-Vision with DSpark speculative decoding.
 
-### Prefill Down-Projection + Scatter Speedup (sm_121)
+### Prefill Down-Projection + Scatter Speedup (NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory)
 
 | Prefill Rows ($M$) | Stock Reconstruct + GEMM | Native Fat Scatter | Net Speedup | Parity Cosine Similarity |
 |---|---|---|:---:|:---:|
@@ -52,9 +53,31 @@ Version `0.3.1` adds accelerated $128 \times 128$ tiled prefill CUDA kernels and
 | **$M = 1024$** | 400.4 $\mu\text{s}$ | **195.3 $\mu\text{s}$** | **2.05x** | 1.000000 |
 | **$M = 2048$** | 733.1 $\mu\text{s}$ | **508.7 $\mu\text{s}$** | **1.44x** | 1.000000 |
 
-## v0.3.0 Native Kernel Suite & Benchmark Receipts (DGX Spark GB10)
+### Speculation and Context Scaling Helpers
 
-Version `0.3.0` introduced custom native CUDA kernels (`csrc/`) replacing the stock `exllamav3_ext` decode and prefill paths on Blackwell `sm_121` architectures:
+The plugin exposes small serving-side helpers so a scheduler and its
+admission checks share one policy:
+
+* **Dynamic speculative draft scheduler** —
+  `get_speculative_draft_tokens(batch_size)` selects `K=3` for batches `[1..4]`,
+  `K=2` for `[5..8]`, `K=1` for `[9..16]`, and `K=0` otherwise. Override the
+  ranges with `VLLM_EXL3_SPEC_SCHEDULE=1:4:3,5:8:2,9:16:1` or a caller-supplied
+  schedule.
+* **Vectorized on-device confidence pruning** —
+  `filter_speculative_candidates(probs, threshold=0.5)` keeps only the
+  sequential confident prefix for each sequence and returns a boolean mask
+  plus per-sequence kept counts. Enable the integration with
+  `VLLM_EXL3_ADAPTIVE_VERIFICATION=1` (also accepts `true`, `yes`, or `on`).
+* **MLA KV-cache headroom** — `compute_mla_kv_cache_bytes` and
+  `validate_context_scaling` model compressed KV storage before a launch. At
+  the default 43 layers and FP8 storage, 64K requires **1.51 GiB**, 128K
+  requires **3.02 GiB**, and 256K requires **6.05 GiB**. The validator reports
+  usable headroom and physical safety margin for NVIDIA DGX Spark GB10
+  (sm_121 Blackwell) with 128 GiB Unified Memory.
+
+## v0.3.0 Native Kernel Suite & Benchmark Receipts (NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory)
+
+Version `0.3.0` introduced custom native CUDA kernels (`csrc/`) replacing the stock `exllamav3_ext` decode and prefill paths on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory:
 
 * **In-Register Trellis Dequantization (`csrc/exl3_dequant.cuh`)**: Unrolls MCG bit extraction into registers without intermediate global memory roundtrips.
 * **Dense & Batched GEMV (`csrc/exl3_gemv.cu`, `csrc/p2b_batched.cu`)**: Active-expert batched GEMV saturating 99.2% of the physical memory bandwidth floor (73.3 $\mu\text{s}$).
@@ -64,7 +87,7 @@ Version `0.3.0` introduced custom native CUDA kernels (`csrc/`) replacing the st
 
 ### Live Head-to-Head Benchmark Receipts
 
-Measured simultaneously across two physical NVIDIA DGX Spark GB10 nodes (Baseline ExLlamaV3 vs. Native EXL3) running `GLM-5.3-Flash-EXL3-K2` via live vLLM HTTP streaming API:
+Measured simultaneously across two physical NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory nodes (Baseline ExLlamaV3 vs. Native EXL3) running `GLM-5.3-Flash-EXL3-K2` via live vLLM HTTP streaming API:
 
 | Category | Baseline ExLlamaV3 | Native EXL3 | Baseline TTFT | Native TTFT | Net Speedup |
 |---|---|---|---|---|:---:|
@@ -86,7 +109,7 @@ Measured simultaneously across two physical NVIDIA DGX Spark GB10 nodes (Baselin
 * **NVMe Storage Scaling**: 8-worker parallel read reaches **3,563 MB/s** ($3.0\times$ speedup over single-thread 1,185 MB/s), loading 96 GB weights in ~27 seconds.
 
 ### Essential Serving Flag
-When running on DGX Spark or long-context instances, pass:
+When running on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory or other long-context instances, pass:
 ```bash
 --long-prefill-token-threshold 1024
 ```
@@ -172,8 +195,8 @@ and will be removed in a future release.
 
 ## Recipes
 
-- [GLM-5.3-Flash EXL3 K2 on one DGX Spark](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe)
-- [GLM-5.3-Flash EXL3 K2/K3 mix on one DGX Spark](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe)
+- [GLM-5.3-Flash EXL3 K2 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe)
+- [GLM-5.3-Flash EXL3 K2/K3 mix on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe)
 
 ## Credits and upstream work
 
@@ -218,9 +241,9 @@ Apache-2.0. Redistribution must retain the [NOTICE](NOTICE) file — see
 
 | Recipe | Description |
 |---|---|
-| [GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2 on DGX Spark |
-| [GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2/K3 mix on DGX Spark |
-| [DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe) | DeepSeek-V4-Flash Vision EXL3 MixedK on DGX Spark: stock 0.28.0 and nightly vision routes, DSpark speculative decoding, tool calling, remote vision test guide |
+| [GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2 on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory |
+| [GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe](https://github.com/vcruz305/GLM-5.3-Flash-EXL3-K2K3-mix-DGX-Spark-recipe) | GLM-5.3-Flash EXL3 K2/K3 mix on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory |
+| [DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe](https://github.com/vcruz305/DeepSeek-V4-Flash-Vision-EXL3-MixedK-DGX-Spark-recipe) | DeepSeek-V4-Flash Vision EXL3 MixedK on NVIDIA DGX Spark GB10 (sm_121 Blackwell) with 128 GiB Unified Memory: stock 0.28.0 and nightly vision routes, DSpark speculative decoding, tool calling, remote vision test guide |
 | [GLM-5.3-Flash-EXL3-K2-spark-vllm](https://huggingface.co/vcruz305/GLM-5.3-Flash-EXL3-K2-spark-vllm) | Prebuilt vLLM runtime wheels |
 
 

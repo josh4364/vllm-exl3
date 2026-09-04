@@ -7,6 +7,9 @@ copyright and permission notices are reproduced below as those licences require.
 
 ## Mia's AI Lab, GLM-5.3-Flash-EXL3-2x-DGX-Sparks
 
+Authors: Mia's AI Lab ([@MiaAI-Lab](https://github.com/MiaAI-Lab)) and
+[@plotarmordev](https://github.com/plotarmordev).
+
 https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks
 
 **Files copied from that project into this one:**
@@ -50,6 +53,8 @@ SOFTWARE.
 ---
 
 ## Turboderp, ExLlamaV3
+
+Author: [@turboderp](https://github.com/turboderp).
 
 https://github.com/turboderp/exllamav3
 
