@@ -14,7 +14,9 @@
   `e / topk`); pointer tables resolved once per block into shared memory; tile configuration
   table (`VLLM_EXL3_P2B_CFG`, default CFG 1). On a DGX Spark GB10 with GLM-5.3-Flash K2: 1.65 ms
   for a 3-row / 24-expert step vs 2.80 ms for ExLlamaV3 `exl3_moe`; end-to-end decode
-  8.9 -> 14.1 tok/s on the recipe's 128-token harness with MTP k=2.
+  8.9 -> 14.1 tok/s on the recipe's 128-token harness with MTP k=2 (both measured while the
+  GB10 was firmware-capped at ~800 MHz; at the rated ~2400 MHz the same step takes 0.65 ms vs
+  1.04 ms and the harness reads 31.7 tok/s with the EXL3 lm_head).
 - **`Exl3LMHeadMethod`**: EXL3 `ParallelLMHead`, declared under
   `non_routed_exl3.layers["<prefix>.lm_head"]`; `tools/lm_head_overlay.py` fetches the Hub
   pack's quantized head. 5-bit head: 2.7 ms vs 9.5 ms BF16 per projection on GB10, identical
