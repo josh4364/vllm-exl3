@@ -40,16 +40,18 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
             if (ext_include / "quant").is_dir():
                 include_dirs.append(str(ext_include / "quant"))
 
+        # setuptools requires ext sources relative to setup.py (absolute paths are
+        # rejected: "setup script specifies an absolute path"); include_dirs may be absolute.
         ext_modules.append(
             CUDAExtension(
                 name="vllm_exl3_c",
                 sources=[
-                    str(ROOT / "csrc" / "bindings.cpp"),
-                    str(ROOT / "csrc" / "exl3_gemv.cu"),
-                    str(ROOT / "csrc" / "p2b_batched.cu"),
-                    str(ROOT / "csrc" / "p2b_moe.cu"),
-                    str(ROOT / "csrc" / "exl3_gemm.cu"),
-                    str(ROOT / "csrc" / "exl3_fat_gemm.cu"),
+                    "csrc/bindings.cpp",
+                    "csrc/exl3_gemv.cu",
+                    "csrc/p2b_batched.cu",
+                    "csrc/p2b_moe.cu",
+                    "csrc/exl3_gemm.cu",
+                    "csrc/exl3_fat_gemm.cu",
                 ],
                 include_dirs=include_dirs,
                 extra_compile_args={
